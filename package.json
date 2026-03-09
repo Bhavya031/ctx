@@ -1,0 +1,14 @@
+{
+  "name": "lingo-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "ctx": "./agent.ts"
+  },
+  "scripts": {
+    "agent": "bun run agent.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0"
+  }
+}
