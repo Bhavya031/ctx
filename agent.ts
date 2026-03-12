@@ -304,13 +304,6 @@ async function run() {
     process.exit(1);
   }
 
-  // Get instructions: --prompt flag or ask interactively
-  let instructions = values.prompt;
-  if (!instructions) {
-    instructions = await textPrompt("What should the agent focus on?");
-    if (!instructions) { console.error("❌ No instructions provided."); process.exit(1); }
-  }
-
   const client = new Anthropic();
   const hasContext   = fs.existsSync(outPath);
   const isUpdateMode = hasContext && commitCount === null;
@@ -339,30 +332,57 @@ Always write the output file as your final action.`;
     `\nExplore the codebase and write the context file.`,
   ].join("\n");
 
+  // --- Update / Commit mode: check for changes BEFORE asking for instructions ---
+  let earlyChangedFiles: FileEntry[] | null = null;
+  if (isUpdateMode || isCommitMode) {
+    const state = loadState(outPath);
+    earlyChangedFiles = filterNewFiles(getChangedFiles(targetDir, commitCount), state);
+    const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
+
+    if (earlyChangedFiles.length === 0) {
+      console.log(`✅ No new changes (${modeLabel}) — context.md is up to date.`);
+      const choice = await selectMenu("Regenerate anyway?", ["No, exit", "Yes, regenerate"], 0);
+      if (choice === 0) return;
+
+      // Only now ask what to focus on
+      const override = values.prompt ?? await textPrompt("What should the full regeneration cover?", "blank for default");
+      const regen = override || "Generate a comprehensive context summary of this codebase.";
+      clearState(outPath);
+      await runAgent(client, freshSystem, freshMessage(regen), allTools);
+      const allFiles = listFiles(targetDir);
+      recordFiles(allFiles.map((f) => [f, fileHash(f)]), outPath);
+      return printDone();
+    }
+  }
+
+  // Get instructions: --prompt flag or ask interactively
+  let instructions = values.prompt;
+  if (!instructions) {
+    const question = hasContext
+      ? "What changed or what should the update cover?"
+      : "What should the context summary include?";
+    const defaultInstr = hasContext
+      ? "Update the context to reflect any recent changes."
+      : "Generate a comprehensive context summary of this codebase.";
+    instructions = await textPrompt(question, "blank for default");
+    if (!instructions) instructions = defaultInstr;
+  }
+
   // --- Fresh mode ---
   if (isFreshMode) {
     console.log(`🆕 Mode         : Fresh scan\n`);
     clearState(outPath);
     await runAgent(client, freshSystem, freshMessage(instructions), allTools);
+    // Snapshot all files so update mode only re-processes truly changed ones
+    const allFiles = listFiles(targetDir);
+    const entries: FileEntry[] = allFiles.map((f) => [f, fileHash(f)]);
+    recordFiles(entries, outPath);
   }
 
-  // --- Update / Commit mode ---
-  if (isUpdateMode || isCommitMode) {
-    const state        = loadState(outPath);
-    const changedFiles = filterNewFiles(getChangedFiles(targetDir, commitCount), state);
-    const modeLabel    = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
-
-    if (changedFiles.length === 0) {
-      console.log(`✅ No new changes (${modeLabel}) — context.md is up to date.`);
-      const choice = await selectMenu("Regenerate anyway?", ["No, exit", "Yes, regenerate"], 0);
-      if (choice === 0) return;
-
-      const override = await textPrompt("What to focus on?", "blank to keep original prompt");
-      clearState(outPath);
-      await runAgent(client, freshSystem, freshMessage(override || instructions), allTools);
-      return printDone();
-    }
-
+  // --- Update / Commit mode: run with already-computed changed files ---
+  if ((isUpdateMode || isCommitMode) && earlyChangedFiles && earlyChangedFiles.length > 0) {
+    const changedFiles = earlyChangedFiles;
+    const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
     const icon = isCommitMode ? "🔖" : "♻️ ";
     console.log(`${icon} Mode         : Update (${changedFiles.length} new/changed file(s) from ${modeLabel})\n`);
 
@@ -387,3 +407,4 @@ Write the full updated context using write_file.`;
 }
 
 run().catch((e) => { console.error("❌", e.message); process.exit(1); });
+
