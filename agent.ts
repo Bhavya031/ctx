@@ -11,11 +11,12 @@ import { createHash } from "crypto";
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),
   options: {
-    prompt:  { type: "string",  short: "p" },
-    out:     { type: "string",  short: "o", default: "lingo-context.md" },
-    model:   { type: "string",  short: "m", default: "claude-haiku-4-5" },
-    commits: { type: "string",  short: "c" },
-    help:    { type: "boolean", short: "h", default: false },
+    prompt:   { type: "string",  short: "p" },
+    out:      { type: "string",  short: "o", default: "lingo-context.md" },
+    model:    { type: "string",  short: "m", default: "claude-haiku-4-5" },
+    commits:  { type: "string",  short: "c" },
+    "dry-run": { type: "boolean", short: "d", default: false },
+    help:     { type: "boolean", short: "h", default: false },
   },
   allowPositionals: true,
 });
@@ -32,6 +33,7 @@ Options:
   -o, --out         Output file        (default: lingo-context.md)
   -m, --model       Claude model       (default: claude-haiku-4-5)
   -c, --commits <n> Use files changed in last N commits instead of uncommitted
+  -d, --dry-run     Show what would run without writing anything
   -h, --help        Show this help
 
 Modes:
@@ -52,6 +54,7 @@ const targetDir   = path.resolve(positionals[0] ?? process.cwd());
 const outPath     = path.resolve(targetDir, values.out!);
 const model       = values.model!;
 const commitCount = values.commits ? parseInt(values.commits, 10) : null;
+const dryRun      = values["dry-run"]!;
 
 // --- Interactive prompts ---
 
@@ -372,6 +375,51 @@ function injectJsoncComments(filePath: string, comments: Record<string, string>)
   fs.writeFileSync(filePath, result.join("\n"), "utf-8");
 }
 
+function parseSections(content: string): Record<string, string> {
+  const sections: Record<string, string> = {};
+  const parts = content.split(/^(## .+)$/m);
+  for (let i = 1; i < parts.length; i += 2) {
+    sections[parts[i].trim()] = parts[i + 1]?.trim() ?? "";
+  }
+  return sections;
+}
+
+function printUpdateSummary(before: string, after: string): void {
+  const prev = parseSections(before);
+  const next = parseSections(after);
+  const allKeys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+  const lines: string[] = [];
+
+  for (const key of allKeys) {
+    const label = key.replace("## ", "");
+    if (!prev[key]) {
+      lines.push(`  + ${label} (new section)`);
+    } else if (!next[key]) {
+      lines.push(`  - ${label} (removed)`);
+    } else if (prev[key] !== next[key]) {
+      const pluralize = (n: number, word: string) => `${n} ${word}${n !== 1 ? "s" : ""}`;
+      if (label === "Tricky Terms") {
+        const countRows = (s: string) => s.split("\n").filter(l => l.startsWith("| ") && !l.includes("---") && !l.includes("Term |")).length;
+        const added = countRows(next[key]) - countRows(prev[key]);
+        const suffix = added > 0 ? ` (+${pluralize(added, "term")})` : "";
+        lines.push(`  ~ ${label}${suffix}`);
+      } else if (label === "Files") {
+        const countFiles = (s: string) => (s.match(/^### /gm) ?? []).length;
+        const added = countFiles(next[key]) - countFiles(prev[key]);
+        const suffix = added > 0 ? ` (+${pluralize(added, "file")})` : "";
+        lines.push(`  ~ ${label}${suffix}`);
+      } else {
+        lines.push(`  ~ ${label}`);
+      }
+    }
+  }
+
+  if (lines.length) {
+    console.log("\n  Summary:");
+    for (const l of lines) console.log(l);
+  }
+}
+
 async function runJsoncInjection(client: Anthropic, files: string[], contextPath: string): Promise<void> {
   if (files.length === 0) return;
   const lingoContext = readFile(contextPath);
@@ -416,24 +464,12 @@ async function run() {
     bucketIncludes = Object.values(i18n.buckets ?? {})
       .flatMap((b: any) => b.include ?? [])
       .map((p: string) => p.replace("[locale]", sourceLocale));
-    // Explicit jsonc bucket entries
-    jsoncSourceFiles = (i18n.buckets?.jsonc?.include ?? [])
+    // Detect jsonc source files from ANY bucket whose include paths end in .jsonc
+    jsoncSourceFiles = Object.values(i18n.buckets ?? {})
+      .flatMap((b: any) => b.include ?? [])
+      .filter((p: string) => p.endsWith(".jsonc"))
       .map((p: string) => path.resolve(targetDir, p.replace("[locale]", sourceLocale)))
       .filter((f: string) => fs.existsSync(f));
-
-    // Also auto-detect any .jsonc files in the same directories as other bucket files
-    const localeDirs = new Set(
-      bucketIncludes.map((p) => path.dirname(path.resolve(targetDir, p)))
-    );
-    for (const dir of localeDirs) {
-      if (!fs.existsSync(dir)) continue;
-      for (const entry of fs.readdirSync(dir)) {
-        if (entry.endsWith(".jsonc") && entry.includes(sourceLocale)) {
-          const full = path.join(dir, entry);
-          if (!jsoncSourceFiles.includes(full)) jsoncSourceFiles.push(full);
-        }
-      }
-    }
   } catch {}
 
   // Resolve bucket glob patterns to actual file paths
@@ -512,13 +548,15 @@ Always write the output file as your final action.`;
     `\nExplore the project and write lingo-context.md.`,
   ].join("\n");
 
+  const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
+  const logFile   = (f: string) => console.log(`    ~ ${path.relative(targetDir, f)}`);
+
   // --- Update / Commit mode: check for changes BEFORE asking for instructions ---
   let earlyChangedFiles: FileEntry[] | null = null;
   if (isUpdateMode || isCommitMode) {
     const state = loadState(outPath);
     const allChanged = getChangedFiles(targetDir, commitCount).filter(matchesBucket);
     earlyChangedFiles = filterNewFiles(allChanged, state);
-    const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
 
     if (earlyChangedFiles.length === 0) {
       console.log(`  ✓ No new changes (${modeLabel}) — lingo-context.md is up to date.`);
@@ -534,6 +572,29 @@ Always write the output file as your final action.`;
       recordFiles(allFiles.map((f) => [f, fileHash(f)]), outPath);
       return printDone();
     }
+  }
+
+  // --- Dry run: print plan and exit ---
+  if (dryRun) {
+    if (isFreshMode) {
+      console.log(`  Mode          : Fresh scan (would generate lingo-context.md)`);
+      if (jsoncSourceFiles.length) {
+        console.log(`  JSONC inject  : ${jsoncSourceFiles.length} file(s)`);
+        jsoncSourceFiles.forEach(logFile);
+      }
+    } else if (earlyChangedFiles && earlyChangedFiles.length > 0) {
+      console.log(`  Mode          : Update (${earlyChangedFiles.length} file(s) from ${modeLabel})`);
+      earlyChangedFiles.forEach(([f]) => logFile(f));
+      const jsonc = earlyChangedFiles.map(([f]) => f).filter((f) => jsoncSourceFiles.includes(f));
+      if (jsonc.length) {
+        console.log(`  JSONC inject  : ${jsonc.length} file(s)`);
+        jsonc.forEach(logFile);
+      }
+    } else {
+      console.log(`  Mode          : Up to date — nothing to do`);
+    }
+    console.log(`\n  dry-run — no files written`);
+    return;
   }
 
   // Get instructions: --prompt flag or ask interactively
@@ -562,7 +623,6 @@ Always write the output file as your final action.`;
   // --- Update / Commit mode: run with already-computed changed files ---
   if ((isUpdateMode || isCommitMode) && earlyChangedFiles && earlyChangedFiles.length > 0) {
     const changedFiles = earlyChangedFiles;
-    const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
     console.log(`  Mode          : Update (${changedFiles.length} new/changed file(s) from ${modeLabel})\n`);
 
     const updateSystem = `You are a localization context updater.
@@ -574,9 +634,10 @@ When new strings are added: scan them for ambiguous, idiomatic, or domain-specif
 Do not read any other files — everything you need is provided.
 Write the full updated lingo-context.md using write_file.`;
 
+    const beforeContext = readFile(outPath);
     const updateMessage = [
       `Instructions:\n${instructions}`,
-      `\n--- Existing context ---\n${readFile(outPath)}`,
+      `\n--- Existing context ---\n${beforeContext}`,
       i18nBlock,
       `\n--- Changed files (${modeLabel}) ---${changedFiles.map(([f]) => formatFileBlock(f)).join("")}`,
       `\nUpdate the context file at: ${outPath}`,
@@ -584,6 +645,7 @@ Write the full updated lingo-context.md using write_file.`;
 
     await runAgent(client, updateSystem, updateMessage, writeOnlyTools);
     recordFiles(changedFiles, outPath);
+    printUpdateSummary(beforeContext, readFile(outPath));
 
     // Re-inject comments for any jsonc files that changed
     const changedJsonc = changedFiles.map(([f]) => f).filter((f) => jsoncSourceFiles.includes(f));
