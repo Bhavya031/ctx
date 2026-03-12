@@ -12,7 +12,7 @@ const { values, positionals } = parseArgs({
   args: process.argv.slice(2),
   options: {
     prompt:  { type: "string",  short: "p" },
-    out:     { type: "string",  short: "o", default: "context.md" },
+    out:     { type: "string",  short: "o", default: "lingo-context.md" },
     model:   { type: "string",  short: "m", default: "claude-haiku-4-5" },
     commits: { type: "string",  short: "c" },
     help:    { type: "boolean", short: "h", default: false },
@@ -29,27 +29,27 @@ Arguments:
 
 Options:
   -p, --prompt      What the agent should focus on
-  -o, --out         Output file        (default: context.md)
+  -o, --out         Output file        (default: lingo-context.md)
   -m, --model       Claude model       (default: claude-haiku-4-5)
   -c, --commits <n> Use files changed in last N commits instead of uncommitted
   -h, --help        Show this help
 
 Modes:
-  Fresh   context.md absent → full codebase scan via agent tools
-  Update  context.md exists → only changed files sent to LLM (uncommitted)
-  Commits --commits <n>     → only files changed in last N commits sent to LLM
+  Fresh   lingo-context.md absent → full project scan via agent tools
+  Update  lingo-context.md exists → only changed files sent to LLM (uncommitted)
+  Commits --commits <n>           → only files changed in last N commits sent to LLM
 
 Examples:
-  ctx ./lingo-app -p "summarize the codebase"
-  ctx ./lingo-app -p "focus on the auth system"
-  ctx ./lingo-app --out docs/context.md
+  ctx ./lingo-app -p "B2B SaaS, formal tone"
+  ctx ./lingo-app -p "consumer app, friendly and casual"
+  ctx ./lingo-app --out lingo-context.md
   ctx --commits 3
 `);
   process.exit(0);
 }
 
 const targetDir   = path.resolve(positionals[0] ?? process.cwd());
-const outPath     = path.resolve(values.out!);
+const outPath     = path.resolve(targetDir, values.out!);
 const model       = values.model!;
 const commitCount = values.commits ? parseInt(values.commits, 10) : null;
 
@@ -109,6 +109,11 @@ async function textPrompt(question: string, placeholder = ""): Promise<string> {
       resolve(data.trim());
     });
   });
+}
+
+function die(...lines: string[]): never {
+  for (const line of lines) console.error(line);
+  process.exit(1);
 }
 
 // --- State (stored in ~/.ctx/state/) ---
@@ -211,9 +216,19 @@ function getChangedFiles(cwd: string, commits: number | null): string[] {
     output = git("git status --porcelain", cwd)
       .split("\n").filter(Boolean).map((l) => l.slice(3).trim()).join("\n");
   }
-  return output.split("\n").map((f) => f.trim()).filter(Boolean)
-    .map((f) => path.join(cwd, f))
-    .filter((f) => { try { return fs.statSync(f).isFile(); } catch { return false; } });
+  const paths = output.split("\n").map((f) => f.trim()).filter(Boolean)
+    .map((f) => path.join(cwd, f));
+
+  // Expand directories (e.g. untracked `?? app/locales/`) into individual files
+  const files: string[] = [];
+  for (const p of paths) {
+    try {
+      const stat = fs.statSync(p);
+      if (stat.isFile()) files.push(p);
+      else if (stat.isDirectory()) files.push(...listFiles(p));
+    } catch {}
+  }
+  return files;
 }
 
 function formatFileBlock(filePath: string): string {
@@ -288,7 +303,7 @@ async function runAgent(client: Anthropic, system: string, userMessage: string, 
 
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
     for (const tool of toolUses) {
-      console.log(`🔧 ${tool.name}(${JSON.stringify(tool.input)})`);
+      console.log(`  > ${tool.name}(${JSON.stringify(tool.input)})`);
       toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: executeTool(tool.name, tool.input as Record<string, string>) });
     }
 
@@ -300,8 +315,12 @@ async function runAgent(client: Anthropic, system: string, userMessage: string, 
 
 async function run() {
   if (!fs.existsSync(targetDir)) {
-    console.error(`❌ Target folder not found: ${targetDir}`);
-    process.exit(1);
+    die(`  ✗ Target folder not found: ${targetDir}`);
+  }
+
+  const i18nPath = path.join(targetDir, "i18n.json");
+  if (!fs.existsSync(i18nPath)) {
+    die(`  ! No i18n.json found — is this a lingo project?`, `    Run: npx lingo.dev@latest init`);
   }
 
   const client = new Anthropic();
@@ -310,18 +329,89 @@ async function run() {
   const isCommitMode = hasContext && commitCount !== null;
   const isFreshMode  = !hasContext;
 
-  const i18nContent = readFile(path.join(targetDir, "i18n.json"));
-  const i18nBlock   = i18nContent.startsWith("[Error") ? "" : `\n--- i18n.json ---\n${i18nContent}\n`;
+  const i18nContent = readFile(i18nPath);
+  const i18nBlock   = `\n--- i18n.json ---\n${i18nContent}\n`;
 
-  const printDone = () => console.log(fs.existsSync(outPath) ? `\n✅ Done → ${outPath}` : `\n⚠️  Output file was not created`);
+  // Parse i18n.json to extract source locale, targets, and bucket file patterns
+  let sourceLocale = "en";
+  let targetLocales: string[] = [];
+  let bucketIncludes: string[] = [];
+  try {
+    const i18n = JSON.parse(i18nContent);
+    // Support both {locale: {source, targets}} and flat {locale, locales}
+    sourceLocale  = i18n.locale?.source ?? i18n.locale ?? "en";
+    targetLocales = (i18n.locale?.targets ?? i18n.locales ?? []).filter((l: string) => l !== sourceLocale);
+    bucketIncludes = Object.values(i18n.buckets ?? {})
+      .flatMap((b: any) => b.include ?? [])
+      .map((p: string) => p.replace("[locale]", sourceLocale));
+  } catch {}
 
-  console.log(`📁 Target folder: ${targetDir}`);
-  console.log(`📝 Output       : ${outPath}`);
-  console.log(`🤖 Model        : ${model}`);
+  // Resolve bucket glob patterns to actual file paths
+  function matchesBucket(filePath: string): boolean {
+    return bucketIncludes.some((pattern) => {
+      const abs = path.resolve(targetDir, pattern);
+      return filePath === abs || filePath.endsWith(pattern.replace("[locale]", sourceLocale));
+    });
+  }
 
-  const freshSystem = `You are a codebase analysis agent.
-Use list_files and read_file to explore the target folder.
-Write a thorough but concise context summary using write_file.
+  const printDone = () => console.log(fs.existsSync(outPath) ? `\n  ✓ Done → ${outPath}` : `\n  ! Output file was not created`);
+
+  console.log(`  Target folder : ${targetDir}`);
+  console.log(`  Output        : ${outPath}`);
+  console.log(`  Model         : ${model}`);
+  console.log(`  Source locale : ${sourceLocale}`);
+  if (targetLocales.length) console.log(`  Targets       : ${targetLocales.join(", ")}`);
+
+  const freshSystem = `You are a localization context agent.
+Your job is to generate a lingo-context.md file that helps an AI translation engine produce perfect, consistent translations.
+
+File reading strategy:
+1. i18n.json is already provided — use it to find source locale and bucket file paths
+2. Read the source locale bucket files to understand the actual strings
+3. Read package.json and README for app description
+4. Only read other files if you still need context after those — do not browse the full codebase
+
+Writing rules:
+- Be specific and directive. Bad: "be careful with tone". Good: "use informal tu, not usted".
+- App section must describe what the product actually does — not marketing copy. No phrases like "drive conversion" or "empower users".
+- Language sections must name the exact pitfall. Bad: "Hindi may need adaptation". Good: "Hindi: use everyday Hindustani words, never Sanskritic/formal equivalents — e.g. use 'kaam' not 'karya'".
+- Tricky Terms must flag every string that could be mistranslated due to ambiguity, idiom, or domain jargon — even if the risk seems obvious.
+
+Write lingo-context.md using write_file with this exact structure:
+
+## App
+[What the product does, who it's for, what stage it's at — factual, one short paragraph]
+
+## Tone & Voice
+[Brand voice with explicit dos and don'ts — be directive]
+
+## Audience
+[Who reads these strings — age range, technical level, context in which they see them]
+
+## Languages
+Source: ${sourceLocale}
+Targets: ${targetLocales.join(", ") || "none specified"}
+
+[For each target language — specific, named pitfalls only. No generic advice.]
+### <language code>
+- [concrete rule or named pitfall]
+- [concrete rule or named pitfall]
+
+## Tricky Terms
+[Scan every string in the source locale files. Flag any term that is ambiguous, idiomatic, domain-specific, or has a known mistranslation risk. One entry per term.]
+
+| Term | Risk | Guidance |
+|------|------|----------|
+| [term] | [why it's risky — ambiguity / idiom / jargon] | [exactly how to handle it] |
+
+## Files
+[Per source locale file — only add if it needs rules beyond global tone:]
+
+### <filename>
+What: [what these strings are used for]
+Tone: [file-specific tone rules]
+Priority: [what matters most when translating this file]
+
 Always write the output file as your final action.`;
 
   const freshMessage = (prompt: string) => [
@@ -329,24 +419,25 @@ Always write the output file as your final action.`;
     i18nBlock,
     `Target folder: ${targetDir}`,
     `Output file: ${outPath}`,
-    `\nExplore the codebase and write the context file.`,
+    `\nExplore the project and write lingo-context.md.`,
   ].join("\n");
 
   // --- Update / Commit mode: check for changes BEFORE asking for instructions ---
   let earlyChangedFiles: FileEntry[] | null = null;
   if (isUpdateMode || isCommitMode) {
     const state = loadState(outPath);
-    earlyChangedFiles = filterNewFiles(getChangedFiles(targetDir, commitCount), state);
+    const allChanged = getChangedFiles(targetDir, commitCount).filter(matchesBucket);
+    earlyChangedFiles = filterNewFiles(allChanged, state);
     const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
 
     if (earlyChangedFiles.length === 0) {
-      console.log(`✅ No new changes (${modeLabel}) — context.md is up to date.`);
+      console.log(`  ✓ No new changes (${modeLabel}) — lingo-context.md is up to date.`);
       const choice = await selectMenu("Regenerate anyway?", ["No, exit", "Yes, regenerate"], 0);
       if (choice === 0) return;
 
       // Only now ask what to focus on
       const override = values.prompt ?? await textPrompt("What should the full regeneration cover?", "blank for default");
-      const regen = override || "Generate a comprehensive context summary of this codebase.";
+      const regen = override || "Generate a comprehensive lingo-context.md for this project.";
       clearState(outPath);
       await runAgent(client, freshSystem, freshMessage(regen), allTools);
       const allFiles = listFiles(targetDir);
@@ -362,15 +453,15 @@ Always write the output file as your final action.`;
       ? "What changed or what should the update cover?"
       : "What should the context summary include?";
     const defaultInstr = hasContext
-      ? "Update the context to reflect any recent changes."
-      : "Generate a comprehensive context summary of this codebase.";
+      ? "Update lingo-context.md to reflect any recent changes."
+      : "Generate a comprehensive lingo-context.md for this project.";
     instructions = await textPrompt(question, "blank for default");
     if (!instructions) instructions = defaultInstr;
   }
 
   // --- Fresh mode ---
   if (isFreshMode) {
-    console.log(`🆕 Mode         : Fresh scan\n`);
+    console.log(`  Mode          : Fresh scan\n`);
     clearState(outPath);
     await runAgent(client, freshSystem, freshMessage(instructions), allTools);
     // Snapshot all files so update mode only re-processes truly changed ones
@@ -383,13 +474,16 @@ Always write the output file as your final action.`;
   if ((isUpdateMode || isCommitMode) && earlyChangedFiles && earlyChangedFiles.length > 0) {
     const changedFiles = earlyChangedFiles;
     const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
-    const icon = isCommitMode ? "🔖" : "♻️ ";
-    console.log(`${icon} Mode         : Update (${changedFiles.length} new/changed file(s) from ${modeLabel})\n`);
+    console.log(`  Mode          : Update (${changedFiles.length} new/changed file(s) from ${modeLabel})\n`);
 
-    const updateSystem = `You are a codebase context updater.
-You receive an existing context summary and changed files.
-Update the context to reflect the changes. Keep unchanged sections intact.
-Write the full updated context using write_file.`;
+    const updateSystem = `You are a localization context updater.
+You receive an existing lingo-context.md, i18n.json, and the changed source locale files (${sourceLocale} only).
+Update lingo-context.md to reflect any changes — new strings, renamed keys, new features, tone shifts.
+Keep all unchanged sections exactly as they are.
+
+When new strings are added: scan them for ambiguous, idiomatic, or domain-specific terms and add entries to the ## Tricky Terms table. Be specific — name the exact risk and give directive guidance.
+Do not read any other files — everything you need is provided.
+Write the full updated lingo-context.md using write_file.`;
 
     const updateMessage = [
       `Instructions:\n${instructions}`,
@@ -406,5 +500,5 @@ Write the full updated context using write_file.`;
   printDone();
 }
 
-run().catch((e) => { console.error("❌", e.message); process.exit(1); });
+run().catch((e) => die(`  ✗ ${e.message}`));
 
