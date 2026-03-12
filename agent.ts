@@ -114,15 +114,24 @@ async function textPrompt(question: string, placeholder = ""): Promise<string> {
 // --- State (stored in ~/.ctx/state/) ---
 
 type State = { processedFiles: Record<string, string> };
+type FileEntry = [path: string, hash: string];
 
-function stateDir() {
-  const dir = path.join(process.env.HOME!, ".ctx", "state");
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
+// Created once, reused across all state ops
+let _stateDir: string | undefined;
+function getStateDir(): string {
+  if (!_stateDir) {
+    _stateDir = path.join(process.env.HOME!, ".ctx", "state");
+    fs.mkdirSync(_stateDir, { recursive: true });
+  }
+  return _stateDir;
+}
+
+function md5(data: Buffer | string): string {
+  return createHash("md5").update(data).digest("hex");
 }
 
 function stateFile(p: string) {
-  return path.join(stateDir(), `${createHash("md5").update(p).digest("hex")}.json`);
+  return path.join(getStateDir(), `${md5(p)}.json`);
 }
 
 function loadState(p: string): State {
@@ -135,17 +144,21 @@ function saveState(p: string, state: State) {
 }
 
 function fileHash(f: string): string {
-  try { return createHash("md5").update(fs.readFileSync(f)).digest("hex"); }
+  try { return md5(fs.readFileSync(f)); }
   catch { return ""; }
 }
 
-function filterNewFiles(files: string[], state: State): string[] {
-  return files.filter((f) => fileHash(f) !== state.processedFiles[f]);
+// Returns [path, hash] pairs for files new/changed since last run
+function filterNewFiles(files: string[], state: State): FileEntry[] {
+  return files.flatMap((f) => {
+    const hash = fileHash(f);
+    return hash !== state.processedFiles[f] ? [[f, hash]] : [];
+  });
 }
 
-function recordFiles(files: string[], p: string) {
+function recordFiles(entries: FileEntry[], p: string) {
   const state = loadState(p);
-  for (const f of files) state.processedFiles[f] = fileHash(f);
+  for (const [f, hash] of entries) state.processedFiles[f] = hash;
   saveState(p, state);
 }
 
@@ -157,9 +170,9 @@ function clearState(p: string) {
 
 function readFile(filePath: string): string {
   try {
-    const size = fs.statSync(filePath).size;
-    if (size > 50_000) return `[File too large: ${size} bytes]`;
-    return fs.readFileSync(filePath, "utf-8");
+    const buf = fs.readFileSync(filePath);
+    if (buf.byteLength > 50_000) return `[File too large: ${buf.byteLength} bytes]`;
+    return buf.toString("utf-8");
   } catch (e) {
     return `[Error: ${e}]`;
   }
@@ -200,7 +213,7 @@ function getChangedFiles(cwd: string, commits: number | null): string[] {
   }
   return output.split("\n").map((f) => f.trim()).filter(Boolean)
     .map((f) => path.join(cwd, f))
-    .filter((f) => fs.existsSync(f) && fs.statSync(f).isFile());
+    .filter((f) => { try { return fs.statSync(f).isFile(); } catch { return false; } });
 }
 
 function formatFileBlock(filePath: string): string {
@@ -304,8 +317,10 @@ async function run() {
   const isCommitMode = hasContext && commitCount !== null;
   const isFreshMode  = !hasContext;
 
-  const i18nPath  = path.join(targetDir, "i18n.json");
-  const i18nBlock = fs.existsSync(i18nPath) ? `\n--- i18n.json ---\n${readFile(i18nPath)}\n` : "";
+  const i18nContent = readFile(path.join(targetDir, "i18n.json"));
+  const i18nBlock   = i18nContent.startsWith("[Error") ? "" : `\n--- i18n.json ---\n${i18nContent}\n`;
+
+  const printDone = () => console.log(fs.existsSync(outPath) ? `\n✅ Done → ${outPath}` : `\n⚠️  Output file was not created`);
 
   console.log(`📁 Target folder: ${targetDir}`);
   console.log(`📝 Output       : ${outPath}`);
@@ -334,8 +349,7 @@ Always write the output file as your final action.`;
   // --- Update / Commit mode ---
   if (isUpdateMode || isCommitMode) {
     const state        = loadState(outPath);
-    const allChanged   = getChangedFiles(targetDir, commitCount);
-    const changedFiles = filterNewFiles(allChanged, state);
+    const changedFiles = filterNewFiles(getChangedFiles(targetDir, commitCount), state);
     const modeLabel    = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
 
     if (changedFiles.length === 0) {
@@ -346,8 +360,7 @@ Always write the output file as your final action.`;
       const override = await textPrompt("What to focus on?", "blank to keep original prompt");
       clearState(outPath);
       await runAgent(client, freshSystem, freshMessage(override || instructions), allTools);
-      console.log(fs.existsSync(outPath) ? `\n✅ Done → ${outPath}` : `\n⚠️  Output file was not created`);
-      return;
+      return printDone();
     }
 
     const icon = isCommitMode ? "🔖" : "♻️ ";
@@ -362,7 +375,7 @@ Write the full updated context using write_file.`;
       `Instructions:\n${instructions}`,
       `\n--- Existing context ---\n${readFile(outPath)}`,
       i18nBlock,
-      `\n--- Changed files (${modeLabel}) ---${changedFiles.map(formatFileBlock).join("")}`,
+      `\n--- Changed files (${modeLabel}) ---${changedFiles.map(([f]) => formatFileBlock(f)).join("")}`,
       `\nUpdate the context file at: ${outPath}`,
     ].join("\n");
 
@@ -370,7 +383,7 @@ Write the full updated context using write_file.`;
     recordFiles(changedFiles, outPath);
   }
 
-  console.log(fs.existsSync(outPath) ? `\n✅ Done → ${outPath}` : `\n⚠️  Output file was not created`);
+  printDone();
 }
 
 run().catch((e) => { console.error("❌", e.message); process.exit(1); });
