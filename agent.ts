@@ -311,6 +311,77 @@ async function runAgent(client: Anthropic, system: string, userMessage: string, 
   }
 }
 
+// --- JSONC comment injection ---
+
+async function generateJsoncComments(
+  client: Anthropic,
+  sourceFile: string,
+  lingoContext: string,
+): Promise<Record<string, string>> {
+  const content = readFile(sourceFile);
+  const response = await client.messages.create({
+    model,
+    max_tokens: 4096,
+    messages: [{
+      role: "user",
+      content: `You are generating translator notes for a JSONC localization file.
+
+Localization context:
+${lingoContext}
+
+Source file (${path.basename(sourceFile)}):
+${content}
+
+For each key, write a short one-line translator note that tells the translator:
+- What UI element or context the string appears in
+- Any ambiguity, idiom, or special meaning to watch out for
+- Length or tone constraints if relevant
+
+Return ONLY a flat JSON object mapping each key to its note. No nesting, no explanation.
+Example: {"nav.home": "Navigation item in top header bar", "checkout.submit": "Button — triggers payment, keep short"}`,
+    }],
+  });
+
+  const text = response.content.find((b): b is Anthropic.TextBlock => b.type === "text")?.text ?? "{}";
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return {};
+  try { return JSON.parse(match[0]); } catch { return {}; }
+}
+
+function injectJsoncComments(filePath: string, comments: Record<string, string>): void {
+  const lines = fs.readFileSync(filePath, "utf-8").split("\n");
+  const result: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const keyMatch = line.match(/^(\s*)"([^"]+)"\s*:/);
+    if (keyMatch) {
+      const indent = keyMatch[1];
+      const key = keyMatch[2];
+      // Remove existing comment line immediately above this key
+      if (result.length > 0 && result[result.length - 1].trimStart().startsWith("//")) {
+        result.pop();
+      }
+      if (comments[key]) {
+        result.push(`${indent}// ${comments[key]}`);
+      }
+    }
+    result.push(line);
+  }
+
+  fs.writeFileSync(filePath, result.join("\n"), "utf-8");
+}
+
+async function runJsoncInjection(client: Anthropic, files: string[], contextPath: string): Promise<void> {
+  if (files.length === 0) return;
+  const lingoContext = readFile(contextPath);
+  for (const file of files) {
+    console.log(`  > injecting comments into ${path.basename(file)}`);
+    const comments = await generateJsoncComments(client, file, lingoContext);
+    if (Object.keys(comments).length > 0) injectJsoncComments(file, comments);
+  }
+}
+
 // --- Main ---
 
 async function run() {
@@ -336,6 +407,7 @@ async function run() {
   let sourceLocale = "en";
   let targetLocales: string[] = [];
   let bucketIncludes: string[] = [];
+  let jsoncSourceFiles: string[] = [];
   try {
     const i18n = JSON.parse(i18nContent);
     // Support both {locale: {source, targets}} and flat {locale, locales}
@@ -344,6 +416,24 @@ async function run() {
     bucketIncludes = Object.values(i18n.buckets ?? {})
       .flatMap((b: any) => b.include ?? [])
       .map((p: string) => p.replace("[locale]", sourceLocale));
+    // Explicit jsonc bucket entries
+    jsoncSourceFiles = (i18n.buckets?.jsonc?.include ?? [])
+      .map((p: string) => path.resolve(targetDir, p.replace("[locale]", sourceLocale)))
+      .filter((f: string) => fs.existsSync(f));
+
+    // Also auto-detect any .jsonc files in the same directories as other bucket files
+    const localeDirs = new Set(
+      bucketIncludes.map((p) => path.dirname(path.resolve(targetDir, p)))
+    );
+    for (const dir of localeDirs) {
+      if (!fs.existsSync(dir)) continue;
+      for (const entry of fs.readdirSync(dir)) {
+        if (entry.endsWith(".jsonc") && entry.includes(sourceLocale)) {
+          const full = path.join(dir, entry);
+          if (!jsoncSourceFiles.includes(full)) jsoncSourceFiles.push(full);
+        }
+      }
+    }
   } catch {}
 
   // Resolve bucket glob patterns to actual file paths
@@ -464,10 +554,9 @@ Always write the output file as your final action.`;
     console.log(`  Mode          : Fresh scan\n`);
     clearState(outPath);
     await runAgent(client, freshSystem, freshMessage(instructions), allTools);
-    // Snapshot all files so update mode only re-processes truly changed ones
     const allFiles = listFiles(targetDir);
-    const entries: FileEntry[] = allFiles.map((f) => [f, fileHash(f)]);
-    recordFiles(entries, outPath);
+    recordFiles(allFiles.map((f) => [f, fileHash(f)]), outPath);
+    await runJsoncInjection(client, jsoncSourceFiles, outPath);
   }
 
   // --- Update / Commit mode: run with already-computed changed files ---
@@ -495,6 +584,10 @@ Write the full updated lingo-context.md using write_file.`;
 
     await runAgent(client, updateSystem, updateMessage, writeOnlyTools);
     recordFiles(changedFiles, outPath);
+
+    // Re-inject comments for any jsonc files that changed
+    const changedJsonc = changedFiles.map(([f]) => f).filter((f) => jsoncSourceFiles.includes(f));
+    await runJsoncInjection(client, changedJsonc, outPath);
   }
 
   printDone();
