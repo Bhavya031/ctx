@@ -287,9 +287,34 @@ function executeTool(name: string, input: Record<string, string>): string {
   }
 }
 
+// --- Review ---
+
+const PREVIEW_LINES = 50;
+
+async function reviewContent(label: string, content: string): Promise<"accept" | "skip" | string> {
+  const lines = content.split("\n");
+  const preview = lines.slice(0, PREVIEW_LINES).join("\n");
+  const truncated = lines.length > PREVIEW_LINES;
+
+  const hr = "─".repeat(60);
+  console.log(`\n${hr}`);
+  console.log(`  Review: ${label}`);
+  console.log(hr);
+  console.log(preview);
+  if (truncated) console.log(`\n  ... (${lines.length - PREVIEW_LINES} more lines)`);
+  console.log(hr);
+
+  const choice = await selectMenu("Accept this?", ["Accept", "Request changes", "Skip"], 0);
+  if (choice === 0) return "accept";
+  if (choice === 2) return "skip";
+
+  const feedback = await textPrompt("What should be changed?");
+  return feedback || "skip";
+}
+
 // --- Agent loop ---
 
-async function runAgent(client: Anthropic, system: string, userMessage: string, tools: Anthropic.Tool[]) {
+async function runAgent(client: Anthropic, system: string, userMessage: string, tools: Anthropic.Tool[], review = false) {
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: userMessage }];
 
   while (true) {
@@ -306,8 +331,24 @@ async function runAgent(client: Anthropic, system: string, userMessage: string, 
 
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
     for (const tool of toolUses) {
-      console.log(`  > ${tool.name}(${JSON.stringify(tool.input)})`);
-      toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: executeTool(tool.name, tool.input as Record<string, string>) });
+      const input = tool.input as Record<string, string>;
+
+      if (review && tool.name === "write_file") {
+        const label = path.basename(input.file_path);
+        const result = await reviewContent(label, input.content);
+        if (result === "accept") {
+          console.log(`  > write_file(${JSON.stringify({ file_path: input.file_path })})`);
+          toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: writeFile(input.file_path, input.content) });
+        } else if (result === "skip") {
+          toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: "User skipped this write — do not write this file." });
+        } else {
+          // Feedback: return to agent without writing so it can revise
+          toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: `User requested changes: ${result}\nPlease revise and call write_file again with the updated content.` });
+        }
+      } else {
+        console.log(`  > ${tool.name}(${JSON.stringify(tool.input)})`);
+        toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: executeTool(tool.name, input) });
+      }
     }
 
     messages.push({ role: "user", content: toolResults });
@@ -320,8 +361,10 @@ async function generateJsoncComments(
   client: Anthropic,
   sourceFile: string,
   lingoContext: string,
+  feedback = "",
 ): Promise<Record<string, string>> {
   const content = readFile(sourceFile);
+  const feedbackBlock = feedback ? `\nUser feedback on previous attempt:\n${feedback}\nPlease revise accordingly.\n` : "";
   const response = await client.messages.create({
     model,
     max_tokens: 4096,
@@ -334,7 +377,7 @@ ${lingoContext}
 
 Source file (${path.basename(sourceFile)}):
 ${content}
-
+${feedbackBlock}
 For each key, write a short one-line translator note that tells the translator:
 - What UI element or context the string appears in
 - Any ambiguity, idiom, or special meaning to watch out for
@@ -420,14 +463,36 @@ function printUpdateSummary(before: string, after: string): void {
   }
 }
 
-async function runJsoncInjection(client: Anthropic, files: string[], contextPath: string): Promise<void> {
+async function runJsoncInjection(client: Anthropic, files: string[], contextPath: string, review = false): Promise<void> {
   if (files.length === 0) return;
+  const injected: FileEntry[] = [];
   const lingoContext = readFile(contextPath);
   for (const file of files) {
-    console.log(`  > injecting comments into ${path.basename(file)}`);
-    const comments = await generateJsoncComments(client, file, lingoContext);
-    if (Object.keys(comments).length > 0) injectJsoncComments(file, comments);
+    let comments: Record<string, string> = {};
+    let extraContext = "";
+
+    while (true) {
+      console.log(`  > generating comments for ${path.basename(file)}${extraContext ? " (revised)" : ""}`);
+      comments = await generateJsoncComments(client, file, lingoContext, extraContext);
+      if (Object.keys(comments).length === 0) break;
+
+      if (!review) break;
+
+      const preview = Object.entries(comments)
+        .map(([k, v]) => `  "${k}": "${v}"`)
+        .join("\n");
+      const result = await reviewContent(`comments for ${path.basename(file)}`, preview);
+      if (result === "accept") break;
+      if (result === "skip") { comments = {}; break; }
+      extraContext = result; // feedback → re-generate
+    }
+
+    if (Object.keys(comments).length > 0) {
+      injectJsoncComments(file, comments);
+      injected.push([file, fileHash(file)]);
+    }
   }
+  if (injected.length > 0) recordFiles(injected, contextPath);
 }
 
 // --- Main ---
@@ -567,9 +632,10 @@ Always write the output file as your final action.`;
       const override = values.prompt ?? await textPrompt("What should the full regeneration cover?", "blank for default");
       const regen = override || "Generate a comprehensive lingo-context.md for this project.";
       clearState(outPath);
-      await runAgent(client, freshSystem, freshMessage(regen), allTools);
+      await runAgent(client, freshSystem, freshMessage(regen), allTools, true);
       const allFiles = listFiles(targetDir);
       recordFiles(allFiles.map((f) => [f, fileHash(f)]), outPath);
+      await runJsoncInjection(client, jsoncSourceFiles, outPath, true);
       return printDone();
     }
   }
@@ -614,10 +680,10 @@ Always write the output file as your final action.`;
   if (isFreshMode) {
     console.log(`  Mode          : Fresh scan\n`);
     clearState(outPath);
-    await runAgent(client, freshSystem, freshMessage(instructions), allTools);
+    await runAgent(client, freshSystem, freshMessage(instructions), allTools, true);
     const allFiles = listFiles(targetDir);
     recordFiles(allFiles.map((f) => [f, fileHash(f)]), outPath);
-    await runJsoncInjection(client, jsoncSourceFiles, outPath);
+    await runJsoncInjection(client, jsoncSourceFiles, outPath, true);
   }
 
   // --- Update / Commit mode: run with already-computed changed files ---
@@ -643,13 +709,13 @@ Write the full updated lingo-context.md using write_file.`;
       `\nUpdate the context file at: ${outPath}`,
     ].join("\n");
 
-    await runAgent(client, updateSystem, updateMessage, writeOnlyTools);
+    await runAgent(client, updateSystem, updateMessage, writeOnlyTools, true);
     recordFiles(changedFiles, outPath);
     printUpdateSummary(beforeContext, readFile(outPath));
 
     // Re-inject comments for any jsonc files that changed
     const changedJsonc = changedFiles.map(([f]) => f).filter((f) => jsoncSourceFiles.includes(f));
-    await runJsoncInjection(client, changedJsonc, outPath);
+    await runJsoncInjection(client, changedJsonc, outPath, true);
   }
 
   printDone();
