@@ -463,6 +463,29 @@ function printUpdateSummary(before: string, after: string): void {
   }
 }
 
+async function updateI18nProvider(i18nPath: string, contextPath: string): Promise<void> {
+  const context = readFile(contextPath);
+  const i18nRaw = fs.readFileSync(i18nPath, "utf-8");
+  const i18n = JSON.parse(i18nRaw);
+
+  const newProvider = {
+    id: "anthropic",
+    model: "claude-haiku-4-5",
+    prompt: `Translate from {source} to {target}.\n\n${context}`,
+  };
+
+  if (i18n.provider) {
+    console.log("\n  Existing provider in i18n.json:");
+    console.log(`    id: ${i18n.provider.id}, model: ${i18n.provider.model}`);
+    const choice = await selectMenu("Provider already set — overwrite with updated context?", ["Update", "Keep existing"], 1);
+    if (choice === 1) return;
+  }
+
+  i18n.provider = newProvider;
+  fs.writeFileSync(i18nPath, JSON.stringify(i18n, null, 2), "utf-8");
+  console.log("  > updated provider in i18n.json");
+}
+
 async function runJsoncInjection(client: Anthropic, files: string[], contextPath: string, review = false): Promise<void> {
   if (files.length === 0) return;
   const injected: FileEntry[] = [];
@@ -616,12 +639,41 @@ Always write the output file as your final action.`;
   const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
   const logFile   = (f: string) => console.log(`    ~ ${path.relative(targetDir, f)}`);
 
+  // Resolve bucket include patterns to existing files on disk — handles exact paths and single * globs
+  function resolveBucketFiles(): string[] {
+    const results: string[] = [];
+    for (const p of bucketIncludes) {
+      if (p.includes("*")) {
+        // Single-level glob: split at the * segment and list the directory
+        const dir = path.resolve(targetDir, path.dirname(p));
+        const ext = path.extname(p);
+        try {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            if (entry.isFile() && (!ext || entry.name.endsWith(ext))) {
+              results.push(path.join(dir, entry.name));
+            }
+          }
+        } catch {}
+      } else {
+        const abs = path.resolve(targetDir, p);
+        try { if (fs.statSync(abs).isFile()) results.push(abs); } catch {}
+      }
+    }
+    return results;
+  }
+
   // --- Update / Commit mode: check for changes BEFORE asking for instructions ---
   let earlyChangedFiles: FileEntry[] | null = null;
   if (isUpdateMode || isCommitMode) {
     const state = loadState(outPath);
-    const allChanged = getChangedFiles(targetDir, commitCount).filter(matchesBucket);
-    earlyChangedFiles = filterNewFiles(allChanged, state);
+    const gitChanged = getChangedFiles(targetDir, commitCount);
+
+    // Always include all resolved bucket files — filterNewFiles skips anything already up to date.
+    // This ensures files that are committed (not in git status) or newly added to a bucket
+    // are never silently skipped.
+    const candidates = [...new Set([...gitChanged.filter(matchesBucket), ...resolveBucketFiles()])];
+
+    earlyChangedFiles = filterNewFiles(candidates, state);
 
     if (earlyChangedFiles.length === 0) {
       console.log(`  ✓ No new changes (${modeLabel}) — lingo-context.md is up to date.`);
@@ -633,9 +685,10 @@ Always write the output file as your final action.`;
       const regen = override || "Generate a comprehensive lingo-context.md for this project.";
       clearState(outPath);
       await runAgent(client, freshSystem, freshMessage(regen), allTools, true);
-      const allFiles = listFiles(targetDir);
-      recordFiles(allFiles.map((f) => [f, fileHash(f)]), outPath);
+      const bucketFiles = resolveBucketFiles();
+      recordFiles(bucketFiles.map((f) => [f, fileHash(f)]), outPath);
       await runJsoncInjection(client, jsoncSourceFiles, outPath, true);
+      await updateI18nProvider(i18nPath, outPath);
       return printDone();
     }
   }
@@ -681,8 +734,8 @@ Always write the output file as your final action.`;
     console.log(`  Mode          : Fresh scan\n`);
     clearState(outPath);
     await runAgent(client, freshSystem, freshMessage(instructions), allTools, true);
-    const allFiles = listFiles(targetDir);
-    recordFiles(allFiles.map((f) => [f, fileHash(f)]), outPath);
+    const bucketFiles = resolveBucketFiles();
+    recordFiles(bucketFiles.map((f) => [f, fileHash(f)]), outPath);
     await runJsoncInjection(client, jsoncSourceFiles, outPath, true);
   }
 
@@ -710,7 +763,7 @@ Write the full updated lingo-context.md using write_file.`;
     ].join("\n");
 
     await runAgent(client, updateSystem, updateMessage, writeOnlyTools, true);
-    recordFiles(changedFiles, outPath);
+    recordFiles([...changedFiles, [i18nPath, fileHash(i18nPath)]], outPath);
     printUpdateSummary(beforeContext, readFile(outPath));
 
     // Re-inject comments for any jsonc files that changed
@@ -718,6 +771,7 @@ Write the full updated lingo-context.md using write_file.`;
     await runJsoncInjection(client, changedJsonc, outPath, true);
   }
 
+  await updateI18nProvider(i18nPath, outPath);
   printDone();
 }
 
