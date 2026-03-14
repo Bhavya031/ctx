@@ -3,11 +3,11 @@
 </p>
 
 <p align="center">
-  <strong>ctx — AI context engine for lingo.dev translations</strong>
+  <strong>ctx — AI context engine for lingo.dev</strong>
 </p>
 
 <p align="center">
-  Give your AI translator the institutional knowledge a human translator would have.
+  Your AI translator knows grammar. ctx teaches it your product.
 </p>
 
 <br />
@@ -15,9 +15,9 @@
 <p align="center">
   <a href="#the-problem">Problem</a> •
   <a href="#how-it-works">How It Works</a> •
+  <a href="#agentic-pipeline">Agentic Pipeline</a> •
   <a href="#install">Install</a> •
   <a href="#usage">Usage</a> •
-  <a href="#modes">Modes</a> •
   <a href="#jsonc-translator-notes">JSONC Notes</a>
 </p>
 
@@ -31,34 +31,79 @@
 
 ## The Problem
 
-lingo.dev translates your strings — but it doesn't know what your product does, who it's for, or how it should sound. Without context, translations are technically correct but tonally wrong. "Submit" becomes "Enviar" when it should be "Pagar". Marketing copy gets translated literally. Idiomatic phrases land flat.
+lingo.dev is great at translating strings. What it can't do on its own is understand *your* product — the tone, the audience, the domain jargon, the idiomatic phrases that break when translated literally.
 
-The fix is [`lingo-context.md`](https://lingo.dev/en/translator-context) — a global context file lingo.dev injects into every translation prompt. But writing it by hand is tedious, and keeping it up to date as your codebase evolves is even harder.
+> "ship" → translated as "enviar" (to mail/send) instead of "lanzar" (to launch/deploy)
+> "fly solo" → translated literally instead of "trabajar solo"
+> tú vs vos inconsistency across files because no one wrote down the register rule
 
-**ctx generates and maintains your `lingo-context.md` automatically.** It reads your source locale files, understands your product, and produces a context file that tells the translator exactly what matters — tone, audience, tricky terms, per-file rules.
+lingo.dev solves this with [`lingo-context.md`](https://lingo.dev/en/translator-context) — a global context file it injects into every translation prompt. But writing it by hand takes hours, and keeping it current as your codebase grows is easy to forget.
+
+**ctx automates that entirely.** It reads your project, understands your product, and generates a precise, structured `lingo-context.md`. Then it keeps it in sync as your source files change — file by file, cheaply, only processing what actually changed.
+
+After generating the context, ctx also writes it directly into your `i18n.json` provider prompt so lingo.dev uses it on the next run — no manual copy-paste.
 
 ---
 
 ## How It Works
 
 ```
-your project
-├── i18n.json              ← ctx reads this to find your locales and bucket files
-├── lingo-context.md       ← ctx writes and maintains this
-└── locales/
-    ├── en.json            ← ctx reads your source locale files
-    └── en.jsonc           ← ctx injects per-key translator notes here
+your lingo.dev project
+├── i18n.json              ← ctx reads this: locales, bucket paths, provider config
+├── lingo-context.md       ← ctx generates and maintains this
+└── app/locales/
+    ├── en.tsx             ← source locale files ctx reads and analyses
+    ├── en.jsonc           ← ctx injects per-key translator notes here
+    └── en/
+        └── getting-started.md
 ```
 
-**Three modes:**
+ctx reads `i18n.json` to discover your bucket files, analyses only the source locale, and writes a context file that covers:
 
-| Mode | When | What happens |
-|------|------|-------------|
-| **Fresh** | No `lingo-context.md` yet | Agent explores your project, reads source files, writes full context |
-| **Update** | `lingo-context.md` exists | Only changed source files are sent to LLM — fast and cheap |
-| **Commits** | `--commits <n>` | Uses files changed in last N commits instead of uncommitted changes |
+- **App** — what the product does, factual, no marketing copy
+- **Tone & Voice** — explicit dos and don'ts the translator must follow
+- **Audience** — who reads these strings and in what context
+- **Languages** — per-language pitfalls: pronoun register, dialect, length warnings
+- **Tricky Terms** — every ambiguous, idiomatic, or domain-specific term with exact guidance
+- **Files** — per-file rules for files that need them
 
-Every run shows you a preview of what's about to be written and asks for approval. Request changes and the agent revises inline — the full project context goes with every revision.
+Once written, ctx injects the full context into `i18n.json` as the provider prompt so lingo.dev carries it into every translation automatically.
+
+---
+
+## Agentic Pipeline
+
+ctx runs as a multi-step agentic pipeline. Each step is a separate Claude call with a focused job — not one big prompt trying to do everything.
+
+```
+ctx run
+  │
+  ├── Step 1: Fresh scan (first run only)
+  │     Claude agent explores the project using tools:
+  │     list_files → read_file → write_file
+  │     Reads: i18n.json + bucket files + package.json + README
+  │     Writes: lingo-context.md
+  │
+  ├── Step 2: Per-file update (subsequent runs)
+  │     For each changed source file — one Claude call per file:
+  │     Reads: current lingo-context.md + one changed file
+  │     Updates: only the sections affected by that file
+  │     Records: file hash so it won't re-process unless content changes
+  │
+  ├── Step 3: JSONC comment injection (for .jsonc buckets)
+  │     One Claude call per .jsonc source file:
+  │     Reads: lingo-context.md + source file
+  │     Writes: per-key // translator notes inline in the file
+  │     lingo.dev reads these natively during translation
+  │
+  └── Step 4: Provider sync
+        Writes the full lingo-context.md into i18n.json provider.prompt
+        so lingo.dev uses it automatically — no manual step needed
+```
+
+**Why per-file?** Sending all changed files in one prompt crushes context and produces shallow analysis. Processing one file at a time keeps the window focused — Claude can deeply scan every string for tricky terms rather than skimming.
+
+**Human in the loop:** Before writing anything, ctx shows a preview and waits for approval. You can request changes and the agent revises with full context, or skip a step entirely.
 
 ---
 
@@ -67,13 +112,11 @@ Every run shows you a preview of what's about to be written and asks for approva
 **Requirements:** [Bun](https://bun.sh) and an Anthropic API key.
 
 ```bash
-git clone https://github.com/yourusername/ctx
+git clone https://github.com/bhavya031/ctx
 cd ctx
 bun install
 bun link
 ```
-
-Set your API key:
 
 ```bash
 export ANTHROPIC_API_KEY=your_key_here
@@ -90,14 +133,11 @@ ctx ./my-app
 # With a focus prompt
 ctx ./my-app -p "B2B SaaS, formal tone, legal/compliance domain"
 
-# See what would run without writing anything
+# Preview what would run without writing anything
 ctx ./my-app --dry-run
 
 # Use files changed in last 3 commits
 ctx ./my-app --commits 3
-
-# Custom output path
-ctx ./my-app --out docs/lingo-context.md
 ```
 
 **Options:**
@@ -115,45 +155,32 @@ ctx ./my-app --out docs/lingo-context.md
 
 ## Modes
 
-### Fresh scan
+| Mode | Trigger | What runs |
+|------|---------|-----------|
+| **Fresh** | No `lingo-context.md` yet | Full agent scan — explores project, writes context from scratch |
+| **Update** | Context exists, files changed | Per-file update — one agent call per changed bucket file |
+| **Commits** | `--commits <n>` | Same as update but diffs against last N commits instead of uncommitted |
 
-Run `ctx` in a project with no `lingo-context.md`. The agent explores your project — reads `i18n.json`, source locale files, `package.json`, and `README` — then writes a full context file structured as:
-
-- **App** — what the product does, who it's for
-- **Tone & Voice** — explicit dos and don'ts
-- **Audience** — who reads these strings
-- **Languages** — per-language pitfalls (specific, not generic)
-- **Tricky Terms** — every string with ambiguity, idiom, or mistranslation risk
-- **Files** — per-file rules where needed
-
-### Update mode
-
-Run `ctx` again after making changes. Only your changed source locale files are sent to the LLM — not the full codebase. The agent receives the existing `lingo-context.md` and the diff, updates what changed, and leaves everything else intact.
-
-After writing, ctx prints a summary of what changed:
+On every update run, ctx prints what changed:
 
 ```
+  (1/3) app/locales/en.tsx — analysing...
+  (2/3) app/locales/en.jsonc — analysing...
+  (3/3) app/locales/en/getting-started.md — analysing...
+
   Summary:
-  ~ Tricky Terms (+2 terms)
+  ~ Tricky Terms (+3 terms)
+  ~ Languages
   ~ Files (+1 file)
-  ~ Tone & Voice
 ```
 
-State is tracked via content hashes in `~/.ctx/state/` so only genuinely new or changed files trigger updates.
-
-### Commit mode
-
-```bash
-ctx ./my-app --commits 3
-```
-
-Same as update mode but uses `git diff HEAD~3` instead of uncommitted changes. Useful in CI or after a batch of commits.
+State is tracked via content hashes in `~/.ctx/state/` — only genuinely new or changed files are processed.
 
 ---
 
 ## JSONC Translator Notes
 
-For buckets using `.jsonc` files, ctx injects per-key translator notes directly into the source file:
+For `.jsonc` bucket files, ctx injects per-key translator notes directly into the source:
 
 ```jsonc
 {
@@ -168,53 +195,39 @@ For buckets using `.jsonc` files, ctx injects per-key translator notes directly 
 }
 ```
 
-lingo.dev reads these comments during translation and passes them to the LLM alongside the string. No extra config needed — lingo.dev natively supports JSONC.
-
-Notes are generated from your `lingo-context.md` so they're consistent with your global tone and audience. On update runs, only changed `.jsonc` files get re-annotated.
+lingo.dev reads these `//` comments natively and passes them to the LLM alongside the string. Notes are generated from `lingo-context.md` so they stay consistent with your global rules. Only changed `.jsonc` files get re-annotated on update runs.
 
 ---
 
 ## Review Before Writing
 
-ctx never writes silently. Before updating `lingo-context.md` or injecting JSONC comments, it shows you a preview and asks:
+ctx never writes silently. Every write — context file or JSONC comments — shows a preview first:
 
 ```
 ────────────────────────────────────────────────────────────
   Review: lingo-context.md
 ────────────────────────────────────────────────────────────
 ## App
-A B2B SaaS platform for managing compliance workflows...
+A B2B SaaS tool for managing compliance workflows...
 
 ## Tone & Voice
 Formal, precise. Use "you" not "we"...
-...
+  ... (42 more lines)
 ────────────────────────────────────────────────────────────
 ❯ Accept
   Request changes
   Skip
 ```
 
-Choosing **Request changes** opens a prompt. Your feedback is sent back to the agent with the full project context — it revises and shows you the result again. Repeat until it's right.
+Choose **Request changes**, describe what's wrong, and the agent revises with full context and shows you the result again.
 
 ---
 
 ## Requirements
 
 - [Bun](https://bun.sh) v1.0+
-- Anthropic API key (`ANTHROPIC_API_KEY`)
-- A [lingo.dev](https://lingo.dev) project with `i18n.json`
-
----
-
-## Built for lingo.dev
-
-ctx is designed around how lingo.dev actually works:
-
-- Reads `i18n.json` to find bucket file patterns and locale configuration
-- Supports both `{locale: {source, targets}}` and flat `{locale, locales}` schema formats
-- Filters changed files to source locale bucket files only — no noise
-- Expands untracked directories from `git status` (handles new locale folders correctly)
-- Validates that `i18n.json` exists before running and exits with a helpful message if not
+- `ANTHROPIC_API_KEY`
+- A lingo.dev project with `i18n.json`
 
 ---
 
