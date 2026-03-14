@@ -576,57 +576,36 @@ async function run() {
   console.log(`  Source locale : ${sourceLocale}`);
   if (targetLocales.length) console.log(`  Targets       : ${targetLocales.join(", ")}`);
 
-  const freshSystem = `You are a localization context agent.
-Your job is to generate a lingo-context.md file that helps an AI translation engine produce perfect, consistent translations.
+  const freshSystem = `You are a localization context agent. Generate lingo-context.md so an AI translator produces accurate, consistent translations.
 
-File reading strategy:
-1. i18n.json is already provided — use it to find source locale and bucket file paths
-2. Read the source locale bucket files to understand the actual strings
-3. Read package.json and README for app description
-4. Only read other files if you still need context after those — do not browse the full codebase
+Read: i18n.json (provided) → source bucket files → package.json + README. Stop there unless something is still unclear.
 
-Writing rules:
-- Be specific and directive. Bad: "be careful with tone". Good: "use informal tu, not usted".
-- App section must describe what the product actually does — not marketing copy. No phrases like "drive conversion" or "empower users".
-- Language sections must name the exact pitfall. Bad: "Hindi may need adaptation". Good: "Hindi: use everyday Hindustani words, never Sanskritic/formal equivalents — e.g. use 'kaam' not 'karya'".
-- Tricky Terms must flag every string that could be mistranslated due to ambiguity, idiom, or domain jargon — even if the risk seems obvious.
+Rules:
+- Every rule must be actionable. Bad: "be careful with tone". Good: "use tú not usted — never vos".
+- App section: what it does and who uses it. No marketing language.
+- Language sections: named pitfalls only, no generic advice. Include pronoun register (tú/usted/vos), script/dialect notes, and length warnings.
+- Tricky Terms: flag every ambiguous, idiomatic, or domain-specific term. For tech terms, name the wrong translation risk explicitly (e.g. "ship" — mistranslated as mail/send, means deploy/launch).
 
-Write lingo-context.md using write_file with this exact structure:
+Structure (use exactly):
 
 ## App
-[What the product does, who it's for, what stage it's at — factual, one short paragraph]
-
 ## Tone & Voice
-[Brand voice with explicit dos and don'ts — be directive]
-
 ## Audience
-[Who reads these strings — age range, technical level, context in which they see them]
-
 ## Languages
 Source: ${sourceLocale}
 Targets: ${targetLocales.join(", ") || "none specified"}
-
-[For each target language — specific, named pitfalls only. No generic advice.]
-### <language code>
-- [concrete rule or named pitfall]
-- [concrete rule or named pitfall]
+### <locale>
+- <rule>
 
 ## Tricky Terms
-[Scan every string in the source locale files. Flag any term that is ambiguous, idiomatic, domain-specific, or has a known mistranslation risk. One entry per term.]
-
 | Term | Risk | Guidance |
 |------|------|----------|
-| [term] | [why it's risky — ambiguity / idiom / jargon] | [exactly how to handle it] |
 
 ## Files
-[Per source locale file — only add if it needs rules beyond global tone:]
-
 ### <filename>
-What: [what these strings are used for]
-Tone: [file-specific tone rules]
-Priority: [what matters most when translating this file]
+What / Tone / Priority
 
-Always write the output file as your final action.`;
+Write the file as your final action.`;
 
   const freshMessage = (prompt: string) => [
     `Instructions:\n${prompt}`,
@@ -739,31 +718,47 @@ Always write the output file as your final action.`;
     await runJsoncInjection(client, jsoncSourceFiles, outPath, true);
   }
 
-  // --- Update / Commit mode: run with already-computed changed files ---
+  // --- Update / Commit mode: process each changed file separately ---
   if ((isUpdateMode || isCommitMode) && earlyChangedFiles && earlyChangedFiles.length > 0) {
     const changedFiles = earlyChangedFiles;
     console.log(`  Mode          : Update (${changedFiles.length} new/changed file(s) from ${modeLabel})\n`);
 
-    const updateSystem = `You are a localization context updater.
-You receive an existing lingo-context.md, i18n.json, and the changed source locale files (${sourceLocale} only).
-Update lingo-context.md to reflect any changes — new strings, renamed keys, new features, tone shifts.
-Keep all unchanged sections exactly as they are.
+    const updateSystem = `You are a localization context updater. One file at a time.
 
-When new strings are added: scan them for ambiguous, idiomatic, or domain-specific terms and add entries to the ## Tricky Terms table. Be specific — name the exact risk and give directive guidance.
-Do not read any other files — everything you need is provided.
+Given: existing lingo-context.md + one changed source file. Update the context to reflect it.
+
+Rules:
+- Touch only what this file changes. Leave all other sections as-is.
+- Tricky Terms: scan every string. Add any term that is ambiguous, idiomatic, or has a wrong-translation risk:
+  - Tech verbs with non-obvious meaning (ship = deploy not mail, run = execute not jog, push = git push not shove)
+  - Idioms that fail literally ("off to the races", "bang your head against the wall")
+  - Pronoun/register traps — if the file uses a pronoun register, note it and enforce consistency (e.g. tú throughout — never vos)
+  - Cultural references that don't map across regions
+- Language section: if a new consistency rule emerges from this file, add it.
+
 Write the full updated lingo-context.md using write_file.`;
 
     const beforeContext = readFile(outPath);
-    const updateMessage = [
-      `Instructions:\n${instructions}`,
-      `\n--- Existing context ---\n${beforeContext}`,
-      i18nBlock,
-      `\n--- Changed files (${modeLabel}) ---${changedFiles.map(([f]) => formatFileBlock(f)).join("")}`,
-      `\nUpdate the context file at: ${outPath}`,
-    ].join("\n");
 
-    await runAgent(client, updateSystem, updateMessage, writeOnlyTools, true);
-    recordFiles([...changedFiles, [i18nPath, fileHash(i18nPath)]], outPath);
+    for (let i = 0; i < changedFiles.length; i++) {
+      const [filePath, hash] = changedFiles[i];
+      const fileName = path.relative(targetDir, filePath);
+      console.log(`\n  (${i + 1}/${changedFiles.length}) ${fileName} — analysing...`);
+
+      const currentContext = readFile(outPath);
+      const updateMessage = [
+        `Instructions:\n${instructions}`,
+        `\n--- Existing context ---\n${currentContext}`,
+        i18nBlock,
+        `\n--- File to process ---${formatFileBlock(filePath)}`,
+        `\nUpdate the context file at: ${outPath}`,
+      ].join("\n");
+
+      await runAgent(client, updateSystem, updateMessage, writeOnlyTools, true);
+      recordFiles([[filePath, hash]], outPath);
+    }
+
+    recordFiles([[i18nPath, fileHash(i18nPath)]], outPath);
     printUpdateSummary(beforeContext, readFile(outPath));
 
     // Re-inject comments for any jsonc files that changed
