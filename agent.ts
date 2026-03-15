@@ -8,12 +8,17 @@ import { readFile, listFiles, getChangedFiles, formatFileBlock } from "./src/fil
 import { allTools, writeOnlyTools, runAgent } from "./src/agent-loop.ts";
 import { runJsoncInjection } from "./src/jsonc.ts";
 import { printUpdateSummary, updateI18nProvider } from "./src/i18n.ts";
+import { runResearch } from "./src/research.ts";
 
 const targetDir   = path.resolve(positionals[0] ?? process.cwd());
 const outPath     = path.resolve(targetDir, values.out!);
 const model       = values.model!;
 const commitCount = values.commits ? parseInt(values.commits, 10) : null;
 const dryRun      = values["dry-run"]!;
+const debug       = values["debug"]!;
+
+const dbg = (...args: any[]) => { if (debug) console.log("\x1B[2m[debug]", ...args, "\x1B[0m"); };
+const SKIPPED_MSG = `\n  ! lingo-context.md was not written — skipping JSONC injection and provider update.`;
 
 async function run() {
   if (!fs.existsSync(targetDir)) {
@@ -93,6 +98,11 @@ async function run() {
   console.log(`  Source locale : ${sourceLocale}`);
   if (targetLocales.length) console.log(`  Targets       : ${targetLocales.join(", ")}`);
 
+  dbg(`hasContext=${hasContext} isFreshMode=${isFreshMode} isUpdateMode=${isUpdateMode} isCommitMode=${isCommitMode}`);
+  dbg(`bucketIncludes:`, bucketIncludes);
+  dbg(`jsoncSourceFiles:`, jsoncSourceFiles);
+  dbg(`outPath exists:`, hasContext);
+
   const freshSystem = `You are a localization context agent. Generate lingo-context.md so an AI translator produces accurate, consistent translations.
 
 Read: i18n.json (provided) → source bucket files → package.json + README. Stop there unless something is still unclear.
@@ -124,8 +134,9 @@ What / Tone / Priority
 
 Write the file as your final action.`;
 
-  const freshMessage = (prompt: string) => [
+  const freshMessage = (prompt: string, brief?: string | null) => [
     `Instructions:\n${prompt}`,
+    brief ? `\n${brief}` : "",
     i18nBlock,
     `Target folder: ${targetDir}`,
     `Output file: ${outPath}`,
@@ -137,8 +148,13 @@ Write the file as your final action.`;
   if (isUpdateMode || isCommitMode) {
     const state = loadState(outPath);
     const gitChanged = getChangedFiles(targetDir, commitCount);
-    const candidates = [...new Set([...gitChanged.filter(matchesBucket), ...resolveBucketFiles()])];
+    dbg(`gitChanged:`, gitChanged);
+    const allBucket = resolveBucketFiles();
+    dbg(`resolveBucketFiles:`, allBucket);
+    const candidates = [...new Set([...gitChanged.filter(matchesBucket), ...allBucket])];
+    dbg(`candidates:`, candidates);
     earlyChangedFiles = filterNewFiles(candidates, state);
+    dbg(`earlyChangedFiles:`, earlyChangedFiles.map(([f]) => f));
 
     if (earlyChangedFiles.length === 0) {
       console.log(`  ✓ No new changes (${modeLabel}) — lingo-context.md is up to date.`);
@@ -149,9 +165,15 @@ Write the file as your final action.`;
       const regen = override || "Generate a comprehensive lingo-context.md for this project.";
       clearState(outPath);
       await agent(freshSystem, freshMessage(regen), allTools, true);
-      recordFiles(resolveBucketFiles().map((f) => [f, fileHash(f)]), outPath);
-      await runJsoncInjection(client, model, jsoncSourceFiles, outPath, true);
-      await updateI18nProvider(i18nPath, outPath);
+      recordFiles(allBucket.map((f) => [f, fileHash(f)]), outPath);
+      if (!fs.existsSync(outPath)) {
+        console.log(SKIPPED_MSG);
+        return;
+      }
+      await Promise.all([
+        runJsoncInjection(client, model, jsoncSourceFiles, outPath, true),
+        updateI18nProvider(i18nPath, outPath),
+      ]);
       return printDone();
     }
   }
@@ -188,10 +210,23 @@ Write the file as your final action.`;
   // --- Fresh mode ---
   if (isFreshMode) {
     console.log(`  Mode          : Fresh scan\n`);
+    const brief = await runResearch(client, targetDir, i18nBlock);
     clearState(outPath);
-    await agent(freshSystem, freshMessage(instructions), allTools, true);
-    recordFiles(resolveBucketFiles().map((f) => [f, fileHash(f)]), outPath);
-    await runJsoncInjection(client, model, jsoncSourceFiles, outPath, true);
+    dbg(`ensuring output dir:`, path.dirname(outPath));
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    await agent(freshSystem, freshMessage(instructions, brief), allTools, true);
+    dbg(`after agent — outPath exists:`, fs.existsSync(outPath));
+    if (!fs.existsSync(outPath)) {
+      console.log(SKIPPED_MSG);
+      return;
+    }
+    const bucketFiles = resolveBucketFiles();
+    recordFiles(bucketFiles.map((f) => [f, fileHash(f)]), outPath);
+    await Promise.all([
+      runJsoncInjection(client, model, jsoncSourceFiles, outPath, true),
+      updateI18nProvider(i18nPath, outPath),
+    ]);
+    return printDone();
   }
 
   // --- Update / Commit mode ---
@@ -238,10 +273,12 @@ Write the full updated lingo-context.md using write_file.`;
     printUpdateSummary(beforeContext, readFile(outPath));
 
     const changedJsonc = changedFiles.map(([f]) => f).filter((f) => jsoncSourceFiles.includes(f));
-    await runJsoncInjection(client, model, changedJsonc, outPath, true);
+    await Promise.all([
+      runJsoncInjection(client, model, changedJsonc, outPath, true),
+      updateI18nProvider(i18nPath, outPath),
+    ]);
   }
 
-  await updateI18nProvider(i18nPath, outPath);
   printDone();
 }
 
