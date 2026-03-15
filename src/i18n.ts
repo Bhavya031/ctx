@@ -1,6 +1,7 @@
 import fs from "fs";
 import { readFile } from "./files.ts";
 import { selectMenu } from "./cli.ts";
+import { summaryLine, info } from "./ui.ts";
 
 export function parseSections(content: string): Record<string, string> {
   const sections: Record<string, string> = {};
@@ -42,8 +43,13 @@ export function printUpdateSummary(before: string, after: string): void {
   }
 
   if (lines.length) {
-    console.log("\n  Summary:");
-    for (const l of lines) console.log(l);
+    console.log();
+    for (const l of lines) {
+      const prefix = l.trimStart()[0] as "+" | "-" | "~";
+      const rest = l.replace(/^\s*[+\-~]\s*/, "");
+      const [label, detail] = rest.split(/\s*\((.+)\)$/);
+      summaryLine(prefix, label.trim(), detail);
+    }
   }
 }
 
@@ -60,13 +66,12 @@ export async function updateI18nProvider(i18nPath: string, contextPath: string):
   };
 
   if (i18n.provider) {
-    console.log("\n  Existing provider in i18n.json:");
-    console.log(`    id: ${i18n.provider.id}, model: ${i18n.provider.model}`);
-    const choice = await selectMenu("Provider already set — overwrite with updated context?", ["Update", "Keep existing"], 1);
+    info(`provider: ${i18n.provider.id}  ·  ${i18n.provider.model}`);
+    const choice = await selectMenu("Overwrite provider with updated context?", ["Update", "Keep existing"], 1);
     if (choice === 1) return;
   }
 
   i18n.provider = newProvider;
   fs.writeFileSync(i18nPath, JSON.stringify(i18n, null, 2), "utf-8");
-  console.log("  > updated provider in i18n.json");
+  info(`updated provider in i18n.json`);
 }

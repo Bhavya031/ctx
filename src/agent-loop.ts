@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import path from "path";
 import { selectMenu, textPrompt } from "./cli.ts";
 import { readFile, writeFile } from "./files.ts";
+import { toolCall, reviewBox } from "./ui.ts";
 
 export const allTools: Anthropic.Tool[] = [
   {
@@ -50,25 +51,11 @@ function executeTool(name: string, input: Record<string, string>, listFilesFn: (
   }
 }
 
-const PREVIEW_LINES = 50;
-
 export async function reviewContent(label: string, content: string): Promise<"accept" | "skip" | string> {
-  const lines = content.split("\n");
-  const preview = lines.slice(0, PREVIEW_LINES).join("\n");
-  const truncated = lines.length > PREVIEW_LINES;
-
-  const hr = "─".repeat(60);
-  console.log(`\n${hr}`);
-  console.log(`  Review: ${label}`);
-  console.log(hr);
-  console.log(preview);
-  if (truncated) console.log(`\n  ... (${lines.length - PREVIEW_LINES} more lines)`);
-  console.log(hr);
-
-  const choice = await selectMenu("Accept this?", ["Accept", "Request changes", "Skip"], 0);
+  reviewBox(label, content);
+  const choice = await selectMenu("", ["Accept", "Request changes", "Skip"], 0);
   if (choice === 0) return "accept";
   if (choice === 2) return "skip";
-
   const feedback = await textPrompt("What should be changed?");
   return feedback || "skip";
 }
@@ -88,7 +75,10 @@ export async function runAgent(
     const response = await client.messages.create({ model, max_tokens: 16000, system, tools, messages });
 
     for (const block of response.content) {
-      if (block.type === "text" && block.text.trim()) console.log(block.text);
+      if (block.type === "text" && block.text.trim()) {
+        // dim agent reasoning — it's secondary to the tool calls
+        process.stdout.write(`\x1B[2m     ${block.text.trim()}\x1B[0m\n`);
+      }
     }
 
     if (response.stop_reason !== "tool_use") break;
@@ -104,7 +94,7 @@ export async function runAgent(
         const label = path.basename(input.file_path);
         const result = await reviewContent(label, input.content);
         if (result === "accept") {
-          console.log(`  > write_file(${JSON.stringify({ file_path: input.file_path })})`);
+          toolCall("write_file", input);
           toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: writeFile(input.file_path, input.content) });
         } else if (result === "skip") {
           toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: "User skipped this write — do not write this file." });
@@ -112,7 +102,7 @@ export async function runAgent(
           toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: `User requested changes: ${result}\nPlease revise and call write_file again with the updated content.` });
         }
       } else {
-        console.log(`  > ${tool.name}(${JSON.stringify(tool.input)})`);
+        toolCall(tool.name, input);
         toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: executeTool(tool.name, input, listFilesFn) });
       }
     }

@@ -39,13 +39,16 @@ export function fileHash(f: string): string {
 export function filterNewFiles(files: string[], state: State): FileEntry[] {
   return files.flatMap((f) => {
     const hash = fileHash(f);
+    if (!hash) return [];  // skip unreadable files
     return hash !== state.processedFiles[f] ? [[f, hash]] : [];
   });
 }
 
 export function recordFiles(entries: FileEntry[], p: string) {
   const state = loadState(p);
-  for (const [f, hash] of entries) state.processedFiles[f] = hash;
+  for (const [f, hash] of entries) {
+    if (hash) state.processedFiles[f] = hash;  // never store empty hash
+  }
   saveState(p, state);
 }
 

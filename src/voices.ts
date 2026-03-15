@@ -2,6 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
 import { readFile } from "./files.ts";
 import { reviewContent } from "./agent-loop.ts";
+import { phase, info, warn, fail } from "./ui.ts";
 
 const voiceSystem = `You are a brand voice writer for software localization.
 
@@ -54,13 +55,12 @@ export async function runVoices(
   targetLocales: string[],
 ): Promise<void> {
   if (!fs.existsSync(contextPath)) {
-    console.log(`\n  ✗ lingo-context.md not found at ${contextPath}`);
-    console.log(`    Run ctx first to generate it, then re-run with --voices.`);
+    fail(`lingo-context.md not found — run ctx first, then re-run with --voices.`);
     return;
   }
 
   if (targetLocales.length === 0) {
-    console.log(`\n  ! No target locales in i18n.json — nothing to generate.`);
+    warn(`No target locales in i18n.json — nothing to generate.`);
     return;
   }
 
@@ -69,18 +69,18 @@ export async function runVoices(
   const i18n = JSON.parse(i18nRaw);
   const voices: Record<string, string> = { ...(i18n.provider?.voices ?? {}) };
 
-  console.log(`\n  Generating brand voices for: ${targetLocales.join(", ")}\n`);
+  phase("Brand Voices", targetLocales.join("  "));
 
   for (const locale of targetLocales) {
-    console.log(`  [${locale}] Generating...`);
+    info(`[${locale}]  generating...`);
     let text = await generateVoice(client, model, locale, context);
-    if (!text) { console.log(`  [${locale}] ! No output — skipped`); continue; }
+    if (!text) { warn(`[${locale}]  no output — skipped`); continue; }
 
     while (true) {
-      const result = await reviewContent(`Brand voice: ${locale}`, text);
+      const result = await reviewContent(`Brand voice · ${locale}`, text);
       if (result === "accept") { voices[locale] = text; break; }
-      if (result === "skip")   { console.log(`  [${locale}] skipped`); break; }
-      console.log(`  [${locale}] Revising...`);
+      if (result === "skip")   { info(`[${locale}]  skipped`); break; }
+      info(`[${locale}]  revising...`);
       text = await generateVoice(client, model, locale, context, result, text) || text;
     }
   }
@@ -88,5 +88,5 @@ export async function runVoices(
   if (!i18n.provider) i18n.provider = { id: "anthropic", model };
   i18n.provider.voices = voices;
   fs.writeFileSync(i18nPath, JSON.stringify(i18n, null, 2), "utf-8");
-  console.log(`\n  > wrote brand voices to i18n.json (${Object.keys(voices).length} locale(s))`);
+  info(`wrote ${Object.keys(voices).length} brand voice(s) to i18n.json`);
 }

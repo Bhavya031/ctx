@@ -3,7 +3,8 @@ import fs from "fs";
 import path from "path";
 import { readFile } from "./files.ts";
 import { reviewContent } from "./agent-loop.ts";
-import { recordFiles, fileHash, type FileEntry } from "./state.ts";
+import { fileHash, type FileEntry } from "./state.ts";
+import { toolCall } from "./ui.ts";
 
 export async function generateJsoncComments(
   client: Anthropic,
@@ -69,8 +70,8 @@ export async function runJsoncInjection(
   files: string[],
   contextPath: string,
   review = false,
-): Promise<void> {
-  if (files.length === 0) return;
+): Promise<FileEntry[]> {
+  if (files.length === 0) return [];
   const injected: FileEntry[] = [];
   const lingoContext = readFile(contextPath);
 
@@ -79,7 +80,7 @@ export async function runJsoncInjection(
     let extraContext = "";
 
     while (true) {
-      console.log(`  > generating comments for ${path.basename(file)}${extraContext ? " (revised)" : ""}`);
+      toolCall("annotate", { file_path: path.basename(file) + (extraContext ? "  (revised)" : "") });
       comments = await generateJsoncComments(client, model, file, lingoContext, extraContext);
       if (Object.keys(comments).length === 0) break;
 
@@ -98,5 +99,5 @@ export async function runJsoncInjection(
     }
   }
 
-  if (injected.length > 0) recordFiles(injected, contextPath);
+  return injected;
 }

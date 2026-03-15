@@ -1,10 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { selectMenu, textPrompt } from "./cli.ts";
 import { readFile, listFiles } from "./files.ts";
+import { phase, toolCall, dim } from "./ui.ts";
 
 // Research agent uses Sonnet — needs web search + stronger reasoning
 // web_search_20250305 requires Sonnet — falls back gracefully if unavailable
-const RESEARCH_MODEL = "claude-haiku-4-5";
+const RESEARCH_MODEL = "claude-sonnet-4-6";
 
 const researchSystem = `You are a product research analyst. Research a software product and produce a concise brief that will help an AI translation engine understand the product's market, audience, and tone.
 
@@ -35,7 +36,7 @@ export async function runResearchAgent(
   targetDir: string,
   i18nBlock: string,
 ): Promise<string | null> {
-  console.log("\n  Research agent starting...\n");
+  phase("Research", "scanning project + searching web");
 
   const messages: Anthropic.MessageParam[] = [{
     role: "user",
@@ -88,7 +89,7 @@ export async function runResearchAgent(
     for (const block of response.content) {
       if (block.type === "text" && block.text.trim()) {
         brief = block.text.trim();
-        console.log(block.text);
+        process.stdout.write(`\x1B[2m     ${brief}\x1B[0m\n`);
       }
     }
 
@@ -101,14 +102,13 @@ export async function runResearchAgent(
     for (const tool of toolUses) {
       const input = tool.input as Record<string, string>;
       if (tool.name === "web_search") {
-        console.log(`  > web_search("${input.query}")`);
-        // web_search is handled natively by Anthropic — pass back empty result to continue
+        toolCall("web_search", { query: input.query });
         toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: "" });
       } else if (tool.name === "list_files") {
-        console.log(`  > list_files(${JSON.stringify(input)})`);
+        toolCall("list_files", input);
         toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: JSON.stringify(listFiles(input.directory)) });
       } else if (tool.name === "read_file") {
-        console.log(`  > read_file(${JSON.stringify(input)})`);
+        toolCall("read_file", input);
         toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: readFile(input.file_path) });
       }
     }
@@ -117,7 +117,6 @@ export async function runResearchAgent(
   }
 
   if (!brief) return null;
-  console.log("\n  Research complete.\n");
   return `--- Product Research Brief ---\n${brief}\n--- End Brief ---`;
 }
 

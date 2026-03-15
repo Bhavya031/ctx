@@ -3,13 +3,14 @@ import Anthropic from "@anthropic-ai/sdk";
 import fs from "fs";
 import path from "path";
 import { values, positionals, selectMenu, textPrompt, die } from "./src/cli.ts";
-import { loadState, clearState, fileHash, filterNewFiles, recordFiles } from "./src/state.ts";
+import { loadState, clearState, fileHash, filterNewFiles, recordFiles, type FileEntry } from "./src/state.ts";
 import { readFile, listFiles, getChangedFiles, formatFileBlock } from "./src/files.ts";
 import { allTools, writeOnlyTools, runAgent } from "./src/agent-loop.ts";
 import { runJsoncInjection } from "./src/jsonc.ts";
 import { printUpdateSummary, updateI18nProvider } from "./src/i18n.ts";
 import { runResearch } from "./src/research.ts";
 import { runVoices } from "./src/voices.ts";
+import { printHeader, phase, progress, fileItem, ok, warn, fail, info } from "./src/ui.ts";
 
 const targetDir   = path.resolve(positionals[0] ?? process.cwd());
 const outPath     = path.resolve(targetDir, values.out!);
@@ -20,7 +21,7 @@ const voicesOnly  = values["voices"]!;
 const debug       = values["debug"]!;
 
 const dbg = (...args: any[]) => { if (debug) console.log("\x1B[2m[debug]", ...args, "\x1B[0m"); };
-const SKIPPED_MSG = `\n  ! lingo-context.md was not written — skipping JSONC injection and provider update.`;
+const SKIPPED_MSG = `lingo-context.md was not written — skipping JSONC injection and provider update.`;
 
 async function run() {
   if (!fs.existsSync(targetDir)) {
@@ -90,15 +91,10 @@ async function run() {
   const agent = (system: string, message: string, tools: Anthropic.Tool[], review = false) =>
     runAgent(client, model, system, message, tools, listFiles, review);
 
-  const printDone = () => console.log(fs.existsSync(outPath) ? `\n  ✓ Done → ${outPath}` : `\n  ! Output file was not created`);
+  const printDone = () => fs.existsSync(outPath) ? ok(`Done → ${outPath}`) : warn(`Output file was not created`);
   const modeLabel = isCommitMode ? `last ${commitCount} commit(s)` : "uncommitted";
-  const logFile   = (f: string) => console.log(`    ~ ${path.relative(targetDir, f)}`);
 
-  console.log(`  Target folder : ${targetDir}`);
-  console.log(`  Output        : ${outPath}`);
-  console.log(`  Model         : ${model}`);
-  console.log(`  Source locale : ${sourceLocale}`);
-  if (targetLocales.length) console.log(`  Targets       : ${targetLocales.join(", ")}`);
+  printHeader({ targetDir, outPath, model, source: sourceLocale, targets: targetLocales });
 
   if (voicesOnly) {
     await runVoices(client, model, outPath, i18nPath, targetLocales);
@@ -164,7 +160,7 @@ You MUST call write_file to write lingo-context.md. Do NOT output the file conte
     dbg(`earlyChangedFiles:`, earlyChangedFiles.map(([f]) => f));
 
     if (earlyChangedFiles.length === 0) {
-      console.log(`  ✓ No new changes (${modeLabel}) — lingo-context.md is up to date.`);
+      ok(`No new changes (${modeLabel}) — context is up to date.`);
       const choice = await selectMenu("Regenerate anyway?", ["No, exit", "Yes, regenerate"], 0);
       if (choice === 0) return;
 
@@ -172,15 +168,12 @@ You MUST call write_file to write lingo-context.md. Do NOT output the file conte
       const regen = override || "Generate a comprehensive lingo-context.md for this project.";
       clearState(outPath);
       await agent(freshSystem, freshMessage(regen), allTools, true);
-      recordFiles(allBucket.map((f) => [f, fileHash(f)]), outPath);
-      if (!fs.existsSync(outPath)) {
-        console.log(SKIPPED_MSG);
-        return;
-      }
-      await Promise.all([
-        runJsoncInjection(client, model, jsoncSourceFiles, outPath, true),
-        updateI18nProvider(i18nPath, outPath),
-      ]);
+      if (!fs.existsSync(outPath)) { warn(SKIPPED_MSG); return; }
+      phase("JSONC Injection");
+      const jsoncEntries1 = await runJsoncInjection(client, model, jsoncSourceFiles, outPath, true);
+      phase("Provider Sync");
+      await updateI18nProvider(i18nPath, outPath);
+      recordFiles([...allBucket.map((f) => [f, fileHash(f)] as FileEntry), ...jsoncEntries1, [i18nPath, fileHash(i18nPath)]], outPath);
       return printDone();
     }
   }
@@ -188,20 +181,23 @@ You MUST call write_file to write lingo-context.md. Do NOT output the file conte
   // --- Dry run ---
   if (dryRun) {
     if (isFreshMode) {
-      console.log(`  Mode          : Fresh scan (would generate lingo-context.md)`);
+      phase("Fresh Scan", "would generate lingo-context.md");
       if (jsoncSourceFiles.length) {
-        console.log(`  JSONC inject  : ${jsoncSourceFiles.length} file(s)`);
-        jsoncSourceFiles.forEach(logFile);
+        info(`JSONC inject  ${jsoncSourceFiles.length} file(s)`);
+        jsoncSourceFiles.forEach((f) => fileItem(path.relative(targetDir, f)));
       }
     } else if (earlyChangedFiles && earlyChangedFiles.length > 0) {
-      console.log(`  Mode          : Update (${earlyChangedFiles.length} file(s) from ${modeLabel})`);
-      earlyChangedFiles.forEach(([f]) => logFile(f));
+      phase("Update", `${earlyChangedFiles.length} file(s) from ${modeLabel}`);
+      earlyChangedFiles.forEach(([f]) => fileItem(path.relative(targetDir, f)));
       const jsonc = earlyChangedFiles.map(([f]) => f).filter((f) => jsoncSourceFiles.includes(f));
-      if (jsonc.length) { console.log(`  JSONC inject  : ${jsonc.length} file(s)`); jsonc.forEach(logFile); }
+      if (jsonc.length) {
+        info(`JSONC inject  ${jsonc.length} file(s)`);
+        jsonc.forEach((f) => fileItem(path.relative(targetDir, f)));
+      }
     } else {
-      console.log(`  Mode          : Up to date — nothing to do`);
+      ok(`Up to date — nothing to do`);
     }
-    console.log(`\n  dry-run — no files written`);
+    warn(`dry-run — no files written`);
     return;
   }
 
@@ -216,30 +212,28 @@ You MUST call write_file to write lingo-context.md. Do NOT output the file conte
 
   // --- Fresh mode ---
   if (isFreshMode) {
-    console.log(`  Mode          : Fresh scan\n`);
     const brief = await runResearch(client, targetDir, i18nBlock);
     clearState(outPath);
     dbg(`ensuring output dir:`, path.dirname(outPath));
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    phase("Context Generation", `writing ${path.basename(outPath)}`);
     await agent(freshSystem, freshMessage(instructions, brief), allTools, true);
     dbg(`after agent — outPath exists:`, fs.existsSync(outPath));
-    if (!fs.existsSync(outPath)) {
-      console.log(SKIPPED_MSG);
-      return;
-    }
+    if (!fs.existsSync(outPath)) { warn(SKIPPED_MSG); return; }
     const bucketFiles = resolveBucketFiles();
-    recordFiles(bucketFiles.map((f) => [f, fileHash(f)]), outPath);
-    await Promise.all([
-      runJsoncInjection(client, model, jsoncSourceFiles, outPath, true),
-      updateI18nProvider(i18nPath, outPath),
-    ]);
+    phase("JSONC Injection");
+    const jsoncEntries2 = await runJsoncInjection(client, model, jsoncSourceFiles, outPath, true);
+    phase("Provider Sync");
+    await updateI18nProvider(i18nPath, outPath);
+    // Record all hashes last — after everything completes, so a cancel leaves state unchanged
+    recordFiles([...bucketFiles.map((f) => [f, fileHash(f)] as FileEntry), ...jsoncEntries2, [i18nPath, fileHash(i18nPath)]], outPath);
     return printDone();
   }
 
   // --- Update / Commit mode ---
   if ((isUpdateMode || isCommitMode) && earlyChangedFiles && earlyChangedFiles.length > 0) {
     const changedFiles = earlyChangedFiles;
-    console.log(`  Mode          : Update (${changedFiles.length} new/changed file(s) from ${modeLabel})\n`);
+    phase("Context Update", `${changedFiles.length} changed file(s) from ${modeLabel}`);
 
     const updateSystem = `You are a localization context updater. One file at a time.
 
@@ -259,9 +253,9 @@ You MUST call write_file with the full updated lingo-context.md. Do NOT output t
     const beforeContext = readFile(outPath);
 
     for (let i = 0; i < changedFiles.length; i++) {
-      const [filePath, hash] = changedFiles[i];
+      const [filePath] = changedFiles[i];
       const fileName = path.relative(targetDir, filePath);
-      console.log(`\n  (${i + 1}/${changedFiles.length}) ${fileName} — analysing...`);
+      progress(i + 1, changedFiles.length, fileName);
 
       const currentContext = readFile(outPath);
       const updateMessage = [
@@ -273,17 +267,22 @@ You MUST call write_file with the full updated lingo-context.md. Do NOT output t
       ].join("\n");
 
       await agent(updateSystem, updateMessage, writeOnlyTools, true);
-      recordFiles([[filePath, hash]], outPath);
     }
 
-    recordFiles([[i18nPath, fileHash(i18nPath)]], outPath);
     printUpdateSummary(beforeContext, readFile(outPath));
 
     const changedJsonc = changedFiles.map(([f]) => f).filter((f) => jsoncSourceFiles.includes(f));
-    await Promise.all([
-      runJsoncInjection(client, model, changedJsonc, outPath, true),
-      updateI18nProvider(i18nPath, outPath),
-    ]);
+    phase("JSONC Injection");
+    const jsoncEntries3 = await runJsoncInjection(client, model, changedJsonc, outPath, true);
+    phase("Provider Sync");
+    await updateI18nProvider(i18nPath, outPath);
+
+    // Record all hashes last — after everything completes, so a cancel leaves state unchanged
+    recordFiles([
+      ...changedFiles.map(([f]) => [f, fileHash(f)] as FileEntry),
+      ...jsoncEntries3,
+      [i18nPath, fileHash(i18nPath)],
+    ], outPath);
   }
 
   printDone();
