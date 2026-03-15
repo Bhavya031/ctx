@@ -8,6 +8,7 @@ export const { values, positionals } = parseArgs({
     model:     { type: "string",  short: "m", default: "claude-haiku-4-5" },
     commits:   { type: "string",  short: "c" },
     "dry-run": { type: "boolean", short: "d", default: false },
+    voices:    { type: "boolean", short: "V", default: false },
     debug:     { type: "boolean", short: "D", default: false },
     help:      { type: "boolean", short: "h", default: false },
   },
@@ -27,6 +28,7 @@ Options:
   -m, --model       Claude model       (default: claude-haiku-4-5)
   -c, --commits <n> Use files changed in last N commits instead of uncommitted
   -d, --dry-run     Show what would run without writing anything
+  -V, --voices      Generate per-locale brand voices into i18n.json (requires lingo-context.md)
   -D, --debug       Verbose logging — show all state, tool calls, and file paths
   -h, --help        Show this help
 

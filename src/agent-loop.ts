@@ -85,7 +85,7 @@ export async function runAgent(
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: userMessage }];
 
   while (true) {
-    const response = await client.messages.create({ model, max_tokens: 8096, system, tools, messages });
+    const response = await client.messages.create({ model, max_tokens: 16000, system, tools, messages });
 
     for (const block of response.content) {
       if (block.type === "text" && block.text.trim()) console.log(block.text);

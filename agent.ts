@@ -9,12 +9,14 @@ import { allTools, writeOnlyTools, runAgent } from "./src/agent-loop.ts";
 import { runJsoncInjection } from "./src/jsonc.ts";
 import { printUpdateSummary, updateI18nProvider } from "./src/i18n.ts";
 import { runResearch } from "./src/research.ts";
+import { runVoices } from "./src/voices.ts";
 
 const targetDir   = path.resolve(positionals[0] ?? process.cwd());
 const outPath     = path.resolve(targetDir, values.out!);
 const model       = values.model!;
 const commitCount = values.commits ? parseInt(values.commits, 10) : null;
 const dryRun      = values["dry-run"]!;
+const voicesOnly  = values["voices"]!;
 const debug       = values["debug"]!;
 
 const dbg = (...args: any[]) => { if (debug) console.log("\x1B[2m[debug]", ...args, "\x1B[0m"); };
@@ -98,6 +100,11 @@ async function run() {
   console.log(`  Source locale : ${sourceLocale}`);
   if (targetLocales.length) console.log(`  Targets       : ${targetLocales.join(", ")}`);
 
+  if (voicesOnly) {
+    await runVoices(client, model, outPath, i18nPath, targetLocales);
+    return;
+  }
+
   dbg(`hasContext=${hasContext} isFreshMode=${isFreshMode} isUpdateMode=${isUpdateMode} isCommitMode=${isCommitMode}`);
   dbg(`bucketIncludes:`, bucketIncludes);
   dbg(`jsoncSourceFiles:`, jsoncSourceFiles);
@@ -132,7 +139,7 @@ Targets: ${targetLocales.join(", ") || "none specified"}
 ### <filename>
 What / Tone / Priority
 
-Write the file as your final action.`;
+You MUST call write_file to write lingo-context.md. Do NOT output the file content as text — call write_file.`;
 
   const freshMessage = (prompt: string, brief?: string | null) => [
     `Instructions:\n${prompt}`,
@@ -247,7 +254,7 @@ Rules:
   - Cultural references that don't map across regions
 - Language section: if a new consistency rule emerges from this file, add it.
 
-Write the full updated lingo-context.md using write_file.`;
+You MUST call write_file with the full updated lingo-context.md. Do NOT output the content as text.`;
 
     const beforeContext = readFile(outPath);
 

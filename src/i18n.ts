@@ -56,6 +56,7 @@ export async function updateI18nProvider(i18nPath: string, contextPath: string):
     id: "anthropic",
     model: "claude-haiku-4-5",
     prompt: `Translate from {source} to {target}.\n\n${context}`,
+    ...(i18n.provider?.voices ? { voices: i18n.provider.voices } : {}),
   };
 
   if (i18n.provider) {
