@@ -15,6 +15,7 @@
 <p align="center">
   <a href="#the-problem">Problem</a> •
   <a href="#how-it-works">How It Works</a> •
+  <a href="#brand-voices">Brand Voices</a> •
   <a href="#agentic-pipeline">Agentic Pipeline</a> •
   <a href="#install">Install</a> •
   <a href="#usage">Usage</a> •
@@ -31,7 +32,7 @@
 
 ## The Problem
 
-lingo.dev is great at translating strings. What it can't do on its own is understand *your* product — the tone, the audience, the domain jargon, the idiomatic phrases that break when translated literally.
+lingo.dev is genuinely great — fast, cheap, AI-powered translation that plugs straight into your codebase. But out of the box, it has no idea who *you* are. It'll translate "ship it" differently every time. It'll switch between formal and informal mid-product. It'll call your core feature something different in every locale. The translations are correct — they're just not *yours*.
 
 > "ship" → translated as "enviar" (to mail/send) instead of "lanzar" (to launch/deploy)
 > "fly solo" → translated literally instead of "trabajar solo"
@@ -41,7 +42,16 @@ lingo.dev solves this with [`lingo-context.md`](https://lingo.dev/en/translator-
 
 **ctx automates that entirely.** It reads your project, understands your product, and generates a precise, structured `lingo-context.md`. Then it keeps it in sync as your source files change — file by file, cheaply, only processing what actually changed.
 
-After generating the context, ctx also writes it directly into your `i18n.json` provider prompt so lingo.dev uses it on the next run — no manual copy-paste.
+---
+
+## What ctx Actually Fixes
+
+lingo handles the translation. ctx makes sure every translation sounds like it came from the same company, in the same voice, on the same product. It's the difference between *translated* and *localized*.
+
+- **Pronoun consistency** — picks `tú` or `usted` once, enforces it everywhere. No more mixed register in the same product.
+- **Grammar conventions** — locale-specific rules baked in. German compound nouns, French gender agreements, Japanese politeness levels — defined once, applied always.
+- **Repeated terms** — your product's vocabulary is locked. "Workspace" is always "Workspace", not "Space", "Area", or "Room" depending on which string Claude saw first.
+- **On-brand tone** — not just "be professional" (useless), but "use informal du, keep CTAs under 4 words, never use exclamation marks".
 
 ---
 
@@ -71,6 +81,20 @@ Once written, ctx injects the full context into `i18n.json` as the provider prom
 
 ---
 
+## Brand Voices
+
+Beyond the global context, ctx can generate a **brand voice** per locale — a concise prose brief that tells the translator exactly how your product sounds in that language.
+
+```bash
+ctx ./my-app --voices
+```
+
+A brand voice covers pronoun register (tú/usted, du/Sie, tu/vous), tone, audience context, and any locale-specific conventions pulled from your `lingo-context.md`. Voices are written into `i18n.json` under `provider.voices` and picked up by lingo.dev automatically.
+
+Each voice goes through a review loop — accept, skip, or give feedback and the agent revises.
+
+---
+
 ## Agentic Pipeline
 
 ctx runs as a multi-step agentic pipeline. Each step is a separate Claude call with a focused job — not one big prompt trying to do everything.
@@ -78,32 +102,37 @@ ctx runs as a multi-step agentic pipeline. Each step is a separate Claude call w
 ```
 ctx run
   │
-  ├── Step 1: Fresh scan (first run only)
+  ├── Step 1: Research (first run only, optional)
+  │     Claude searches the web + reads your project files
+  │     Produces a product brief: market, audience, tone conventions
+  │     Or: answer 4 quick questions yourself
+  │
+  ├── Step 2: Fresh scan (first run only)
   │     Claude agent explores the project using tools:
   │     list_files → read_file → write_file
   │     Reads: i18n.json + bucket files + package.json + README
   │     Writes: lingo-context.md
   │
-  ├── Step 2: Per-file update (subsequent runs)
+  ├── Step 3: Per-file update (subsequent runs)
   │     For each changed source file — one Claude call per file:
   │     Reads: current lingo-context.md + one changed file
   │     Updates: only the sections affected by that file
   │     Records: file hash so it won't re-process unless content changes
   │
-  ├── Step 3: JSONC comment injection (for .jsonc buckets)
+  ├── Step 4: JSONC comment injection (for .jsonc buckets)
   │     One Claude call per .jsonc source file:
   │     Reads: lingo-context.md + source file
   │     Writes: per-key // translator notes inline in the file
   │     lingo.dev reads these natively during translation
   │
-  └── Step 4: Provider sync
+  └── Step 5: Provider sync
         Writes the full lingo-context.md into i18n.json provider.prompt
         so lingo.dev uses it automatically — no manual step needed
 ```
 
 **Why per-file?** Sending all changed files in one prompt crushes context and produces shallow analysis. Processing one file at a time keeps the window focused — Claude can deeply scan every string for tricky terms rather than skimming.
 
-**Human in the loop:** Before writing anything, ctx shows a preview and waits for approval. You can request changes and the agent revises with full context, or skip a step entirely.
+**Human in the loop:** Every write shows a preview and waits for approval. You can request changes and the agent revises with full context, or skip a step entirely.
 
 ---
 
@@ -138,6 +167,9 @@ ctx ./my-app --dry-run
 
 # Use files changed in last 3 commits
 ctx ./my-app --commits 3
+
+# Generate brand voices for all target locales
+ctx ./my-app --voices
 ```
 
 **Options:**
@@ -146,9 +178,10 @@ ctx ./my-app --commits 3
 |------|-------|---------|-------------|
 | `--prompt` | `-p` | interactive | What the agent should focus on |
 | `--out` | `-o` | `lingo-context.md` | Output file path |
-| `--model` | `-m` | `claude-haiku-4-5` | Claude model to use |
+| `--model` | `-m` | `claude-sonnet-4-6` | Claude model to use |
 | `--commits` | `-c` | — | Use files changed in last N commits |
 | `--dry-run` | `-d` | `false` | Preview what would run, write nothing |
+| `--voices` | `-V` | `false` | Generate brand voices only |
 | `--help` | `-h` | — | Show help |
 
 ---
@@ -157,24 +190,23 @@ ctx ./my-app --commits 3
 
 | Mode | Trigger | What runs |
 |------|---------|-----------|
-| **Fresh** | No `lingo-context.md` yet | Full agent scan — explores project, writes context from scratch |
+| **Fresh** | No `lingo-context.md` yet | Research → full agent scan → writes context from scratch |
 | **Update** | Context exists, files changed | Per-file update — one agent call per changed bucket file |
 | **Commits** | `--commits <n>` | Same as update but diffs against last N commits instead of uncommitted |
 
 On every update run, ctx prints what changed:
 
 ```
-  (1/3) app/locales/en.tsx — analysing...
-  (2/3) app/locales/en.jsonc — analysing...
-  (3/3) app/locales/en/getting-started.md — analysing...
+  [1/3]  en.tsx
+  [2/3]  en.jsonc
+  [3/3]  en/getting-started.md
 
-  Summary:
   ~ Tricky Terms (+3 terms)
   ~ Languages
   ~ Files (+1 file)
 ```
 
-State is tracked via content hashes in `~/.ctx/state/` — only genuinely new or changed files are processed.
+State is tracked via content hashes in `~/.ctx/state/` — only genuinely new or changed files are processed. Hashes are saved only after the full pipeline completes, so cancelling mid-run leaves state untouched and the same changes are detected next run.
 
 ---
 
@@ -201,7 +233,7 @@ lingo.dev reads these `//` comments natively and passes them to the LLM alongsid
 
 ## Review Before Writing
 
-ctx never writes silently. Every write — context file or JSONC comments — shows a preview first:
+ctx never writes silently. Every write — context file, JSONC comments, or brand voices — shows a preview first:
 
 ```
 ────────────────────────────────────────────────────────────

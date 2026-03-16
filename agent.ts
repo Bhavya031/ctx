@@ -261,7 +261,6 @@ You MUST call write_file with the full updated lingo-context.md. Do NOT output t
       const updateMessage = [
         `Instructions:\n${instructions}`,
         `\n--- Existing context ---\n${currentContext}`,
-        i18nBlock,
         `\n--- File to process ---${formatFileBlock(filePath)}`,
         `\nUpdate the context file at: ${outPath}`,
       ].join("\n");
