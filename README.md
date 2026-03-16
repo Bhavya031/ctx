@@ -14,6 +14,7 @@
 
 <p align="center">
   <a href="#the-problem">Problem</a> •
+  <a href="#what-ctx-actually-fixes">What It Fixes</a> •
   <a href="#how-it-works">How It Works</a> •
   <a href="#brand-voices">Brand Voices</a> •
   <a href="#agentic-pipeline">Agentic Pipeline</a> •
@@ -81,6 +82,105 @@ Once written, ctx injects the full context into `i18n.json` as the provider prom
 
 ---
 
+## UI
+
+ctx has a minimal terminal UI designed to stay out of your way. Every stage is clearly labelled, tool calls are shown inline, and you always know where you are.
+
+**Fresh scan — first run:**
+```
+  ctx  /your-project
+  lingo-context.md  ·  claude-sonnet-4-6  ·  en → es  fr  de
+
+  ◆  Research
+     scanning project + searching web
+
+     ↳  web_search     lingo crypto exchange localization
+     ↳  read_file      en.jsonc
+     ↳  list_files     app/locales
+     ↳  read_file      package.json
+
+  ◆  Context Generation
+     writing lingo-context.md
+
+     ↳  read_file      en.jsonc
+     ↳  read_file      en/getting-started.md
+     ↳  write_file     lingo-context.md
+
+  ◆  JSONC Injection
+     ↳  annotate       en.jsonc
+
+  ┌─ Review: en.jsonc ──────────────────────────────────────┐
+
+  {
+    // Buy/sell action — use financial verb, not generic "send"
+    "trade.submit": "Place order",
+
+    // Shown on empty portfolio — encouraging, not alarming
+    "portfolio.empty": "No assets yet"
+  }
+
+  └──────────────────────────────────────────────────────────┘
+
+  ❯ Accept
+    Request changes
+    Skip
+
+  ◆  Provider Sync
+
+  ✓  Done
+```
+
+**Update run — after changing a file:**
+```
+  ctx  /your-project
+  lingo-context.md  ·  claude-sonnet-4-6  ·  en → es  fr  de
+
+  [1/2]  en.jsonc
+     ↳  write_file     lingo-context.md
+
+  [2/2]  en/getting-started.md
+     ↳  write_file     lingo-context.md
+
+  ~  Tricky Terms  (+2 terms)
+  ~  Files  (getting-started.md updated)
+
+  ◆  JSONC Injection
+     ↳  annotate       en.jsonc
+
+  ◆  Provider Sync
+
+  ✓  Done
+```
+
+**No changes:**
+```
+  ✓  No new changes (uncommitted) — context is up to date.
+
+  ❯ No, exit
+    Yes, regenerate
+```
+
+**Brand voices (`--voices`):**
+```
+  ◆  Brand Voices
+     generating voice for es
+
+  ┌─ Review: voice · es ────────────────────────────────────┐
+
+  Write in Spanish using informal tú throughout — never usted.
+  Tone is direct and confident, like a senior dev talking to
+  a peer. Avoid exclamation marks. Keep CTAs under 4 words.
+  Financial terms use standard Latin American conventions.
+
+  └──────────────────────────────────────────────────────────┘
+
+  ❯ Accept
+    Request changes
+    Skip
+```
+
+---
+
 ## Brand Voices
 
 Beyond the global context, ctx can generate a **brand voice** per locale — a concise prose brief that tells the translator exactly how your product sounds in that language.
@@ -89,7 +189,7 @@ Beyond the global context, ctx can generate a **brand voice** per locale — a c
 ctx ./my-app --voices
 ```
 
-A brand voice covers pronoun register (tú/usted, du/Sie, tu/vous), tone, audience context, and any locale-specific conventions pulled from your `lingo-context.md`. Voices are written into `i18n.json` under `provider.voices` and picked up by lingo.dev automatically.
+A brand voice covers pronoun register (tú/usted, du/Sie, tu/vous), tone, audience context, and locale-specific conventions — all derived from your existing `lingo-context.md`. Voices are written into `i18n.json` under `provider.voices` and picked up by lingo.dev automatically.
 
 Each voice goes through a review loop — accept, skip, or give feedback and the agent revises.
 
@@ -194,18 +294,6 @@ ctx ./my-app --voices
 | **Update** | Context exists, files changed | Per-file update — one agent call per changed bucket file |
 | **Commits** | `--commits <n>` | Same as update but diffs against last N commits instead of uncommitted |
 
-On every update run, ctx prints what changed:
-
-```
-  [1/3]  en.tsx
-  [2/3]  en.jsonc
-  [3/3]  en/getting-started.md
-
-  ~ Tricky Terms (+3 terms)
-  ~ Languages
-  ~ Files (+1 file)
-```
-
 State is tracked via content hashes in `~/.ctx/state/` — only genuinely new or changed files are processed. Hashes are saved only after the full pipeline completes, so cancelling mid-run leaves state untouched and the same changes are detected next run.
 
 ---
@@ -236,22 +324,30 @@ lingo.dev reads these `//` comments natively and passes them to the LLM alongsid
 ctx never writes silently. Every write — context file, JSONC comments, or brand voices — shows a preview first:
 
 ```
-────────────────────────────────────────────────────────────
-  Review: lingo-context.md
-────────────────────────────────────────────────────────────
-## App
-A B2B SaaS tool for managing compliance workflows...
+  ┌─ Review: lingo-context.md ──────────────────────────────┐
 
-## Tone & Voice
-Formal, precise. Use "you" not "we"...
-  ... (42 more lines)
-────────────────────────────────────────────────────────────
-❯ Accept
-  Request changes
-  Skip
+  ## App
+  A B2B SaaS tool for managing compliance workflows...
+
+  ## Tone & Voice
+  Formal, precise. Use "you" not "we"...
+    … 42 more lines
+
+  └──────────────────────────────────────────────────────────┘
+
+  ❯ Accept
+    Request changes
+    Skip
 ```
 
 Choose **Request changes**, describe what's wrong, and the agent revises with full context and shows you the result again.
+
+---
+
+## Tested On
+
+- [lingo-crypto](https://github.com/Bhavya031/lingo-crypto) — crypto exchange UI
+- [others](https://github.com/Bhavya031/others) — mixed project types
 
 ---
 
